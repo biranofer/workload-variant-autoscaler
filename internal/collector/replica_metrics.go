@@ -329,42 +329,49 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 	}
 
 	// Process cache config info results (V2)
+	//
+	// vllm:cache_config_info has no model_name label (see QueryCacheConfigInfo),
+	// so it is queried namespace-wide and may include pods of other models in the
+	// same namespace. Attach cache config only to instances already discovered by
+	// the model-scoped KV/queue queries above; skip unknown instances so foreign
+	// pods are not introduced into this model's metrics (and do not inflate the
+	// discovered-pods / freshness counters).
 	if result := results[registration.QueryCacheConfigInfo]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
-				instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+				instanceKey, podName, _ := buildInstanceKey(value.Labels)
 				if instanceKey == "" {
 					continue
 				}
 
-				if podData[instanceKey] == nil {
-					podData[instanceKey] = &podMetricData{
-						podName: podName,
-						vaName:  vaName,
-					}
+				data := podData[instanceKey]
+				if data == nil {
+					// Instance not seen by the model-scoped queries: it belongs to a
+					// different model (or lacks KV/queue metrics) — not one of ours.
+					continue
 				}
 
 				// Parse num_gpu_blocks and block_size from string labels
 				if blocksStr, ok := value.Labels["num_gpu_blocks"]; ok && blocksStr != "" {
 					if blocks, err := strconv.ParseInt(blocksStr, 10, 64); err == nil {
-						podData[instanceKey].numGpuBlocks = blocks
+						data.numGpuBlocks = blocks
 					}
 				}
 				if sizeStr, ok := value.Labels["block_size"]; ok && sizeStr != "" {
 					if size, err := strconv.ParseInt(sizeStr, 10, 64); err == nil {
-						podData[instanceKey].blockSize = size
+						data.blockSize = size
 					}
 				}
-				if podData[instanceKey].numGpuBlocks > 0 && podData[instanceKey].blockSize > 0 {
-					podData[instanceKey].hasCacheConfig = true
-					podData[instanceKey].cacheConfigTimestamp = value.Timestamp
+				if data.numGpuBlocks > 0 && data.blockSize > 0 {
+					data.hasCacheConfig = true
+					data.cacheConfigTimestamp = value.Timestamp
 				}
 
 				logger.V(logging.DEBUG).Info("Cache config info metric",
 					"instanceKey", instanceKey,
 					"pod", podName,
-					"numGpuBlocks", podData[instanceKey].numGpuBlocks,
-					"blockSize", podData[instanceKey].blockSize)
+					"numGpuBlocks", data.numGpuBlocks,
+					"blockSize", data.blockSize)
 			}
 		}
 	}
