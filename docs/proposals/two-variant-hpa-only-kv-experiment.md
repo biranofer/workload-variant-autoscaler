@@ -180,3 +180,69 @@ approved:
 - `hack/benchmark/scenarios/guides/hpa-kv-prometheus-adapter-rule.yaml` —
   the rule snippet that the script applies via `helm upgrade --reuse-values
   --values`.
+
+---
+
+## Addendum — finding from initial cluster exploration
+
+Discovered after this proposal was first written, while inspecting the
+cluster on 2026-05-29. Recorded here so the team can factor it in during
+review.
+
+The cluster has **two prometheus-adapter installs**, not one:
+
+- `openshift-user-workload-monitoring/prometheus-adapter` (provided by the
+  OpenShift cluster) — serves `v1beta1.custom.metrics.k8s.io` (the Pods /
+  Object metrics path).
+- `workload-variant-autoscaler-monitoring/prometheus-adapter` (installed by
+  the WVA standup) — serves `v1beta1.external.metrics.k8s.io` (the External
+  metrics path used today by the `wva_desired_replicas` HPA).
+
+`v1beta1.custom.metrics.k8s.io` is bound to the OpenShift adapter cluster-wide
+and is not configurable from this repo.
+
+### Implication for the spec
+
+The "Proposal" section above shows the rule under `rules.custom` and the HPA
+metric block as `type: Pods`. **That would target the OpenShift-managed
+adapter we cannot modify.** The implementation should instead extend the
+WVA-installed External adapter with an External rule scoped per variant via
+the existing `llm_d_ai_variant` label:
+
+```yaml
+rules:
+  external:
+    - seriesQuery: 'vllm:kv_cache_usage_perc{llm_d_ai_variant!=""}'
+      resources:
+        overrides:
+          namespace: { resource: "namespace" }
+      name:
+        matches: "^vllm:kv_cache_usage_perc$"
+        as:      "vllm_kv_cache_usage_perc"
+      metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (llm_d_ai_variant, namespace)'
+```
+
+And each HPA reads it as External with a per-variant selector:
+
+```yaml
+metrics:
+  - type: External
+    external:
+      metric:
+        name: vllm_kv_cache_usage_perc
+        selector:
+          matchLabels:
+            llm_d_ai_variant: <va-name>      # primary or secondary
+      target:
+        type: Value
+        value: "800m"                         # 0.8
+```
+
+This is a one-line spec change — same metric, same threshold, same behavior
+windows — but routed through the External path that the WVA setup already
+owns. No conflict with OpenShift's cluster-wide adapter, no API service
+re-registration.
+
+The `llm_d_ai_variant` label is already present on every vLLM scrape thanks
+to the relabeling we added when enabling V2 saturation; no additional
+PodMonitor work is required.
