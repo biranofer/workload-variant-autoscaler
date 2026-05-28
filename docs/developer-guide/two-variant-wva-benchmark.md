@@ -151,6 +151,27 @@ because the default llm-d ships `v0.9.2` which does **not** emit
 
 Set `NS` to your namespace, then walk the steps below from the repo root.
 
+### Step 0 — Place the scenario yaml inside the llm-d-benchmark checkout
+
+`make benchmark-standup` invokes the upstream `llm-d-benchmark` CLI, which
+expects the scenario file at
+`<llm-d-benchmark-checkout>/config/scenarios/guides/two-variant-wva.yaml`.
+That file is **not** part of upstream `llm-d-benchmark` — this repo carries
+the canonical copy at
+[`hack/benchmark/scenarios/guides/two-variant-wva.yaml`](../../hack/benchmark/scenarios/guides/two-variant-wva.yaml).
+Copy it into place once after the first `make benchmark-standup` call (or
+beforehand, if you've already cloned `llm-d-benchmark` manually):
+
+```bash
+mkdir -p llm-d-benchmark/config/scenarios/guides
+cp hack/benchmark/scenarios/guides/two-variant-wva.yaml \
+   llm-d-benchmark/config/scenarios/guides/two-variant-wva.yaml
+```
+
+If `llm-d-benchmark/` does not yet exist, the Makefile target
+`benchmark-prereq` will clone it for you on first standup; re-run the copy
+afterwards.
+
 ### Step 1 — Stand up the primary variant
 
 ```bash
@@ -295,7 +316,7 @@ collector fell back to the per-step batch budget (see
 
 | Path | Role |
 |---|---|
-| `llm-d-benchmark/config/scenarios/guides/two-variant-wva.yaml` | Scenario / values for primary stack (cost 10, min/max 1/10, HPA 100% per 15 s, vllmService enabled) |
+| `hack/benchmark/scenarios/guides/two-variant-wva.yaml` | Scenario / values for primary stack (cost 10, min/max 1/10, HPA 100% per 15 s, vllmService enabled). **Must be copied into `llm-d-benchmark/config/scenarios/guides/` before standup** (see [Step 0](#step-0--place-the-scenario-yaml-inside-the-llm-d-benchmark-checkout)). |
 | `hack/benchmark/add_variant.py` | Creates secondary `Deployment`/`VA`/`HPA` from primary, with the kebab-label trick |
 | `hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml` | ConfigMap setting `analyzerName: saturation` to select V2 |
 | `hack/benchmark/plot_two_variant_pipeline.py` | 5-panel pipeline graph generator |
