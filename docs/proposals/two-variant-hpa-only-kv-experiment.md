@@ -246,3 +246,179 @@ re-registration.
 The `llm_d_ai_variant` label is already present on every vLLM scrape thanks
 to the relabeling we added when enabling V2 saturation; no additional
 PodMonitor work is required.
+
+---
+
+## Update — pivot to the upstream HPA-EPP pattern (2026-05-30)
+
+Recorded after a discussion with the team about what HPA-only baseline to
+compare WVA against. The proposal as originally written invented per-pod KV
+utilization as the HPA signal. The llm-d project already publishes a
+canonical HPA-only autoscaling pattern at
+[`llm-d/llm-d/guides/workload-autoscaling/README.hpa-epp.md`](https://github.com/llm-d/llm-d/tree/main/guides/workload-autoscaling).
+Comparing WVA against *that* pattern is a stronger, more defensible demo
+than comparing against a homegrown KV-threshold scheme.
+
+### Signals the upstream HPA-EPP pattern uses
+
+Two model-level metrics emitted by the EPP, exposed via prometheus-adapter
+as External metrics:
+
+| Adapter `name.as` | Promql `metricsQuery` | HPA target |
+|---|---|---|
+| `epp_queue_size`       | `sum(inference_extension_flow_control_queue_size{inference_pool="<pool>"})` | `Value: "250"` |
+| `epp_running_requests` | `sum(inference_objective_running_requests{top_level_controller_name="<epp>"})` | `AverageValue: "250"` |
+
+Both are *model-level* sums — they have no per-variant attribution. WVA's V2
+analyzer already reads `inference_extension_flow_control_queue_size` (and
+`_queue_bytes`) for the same purpose (see
+`internal/collector/registration/saturation.go:108-126`). Same gateway-side
+signal, different reasoning layer.
+
+HPA behavior in the upstream guide: `scaleUp.stabilizationWindowSeconds: 0`,
+`scaleDown.stabilizationWindowSeconds: 300`, both `Percent: 100 / 15s`.
+
+### Concrete spec replacement
+
+**Adapter rules** (replaces the KV rule above; both rules apply to the
+WVA-installed external adapter):
+
+```yaml
+rules:
+  external:
+    - seriesQuery: 'inference_extension_flow_control_queue_size'
+      resources:
+        overrides:
+          namespace: { resource: "namespace" }
+      name:
+        matches: '^inference_extension_flow_control_queue_size$'
+        as:      'epp_queue_size'
+      metricsQuery: 'sum(inference_extension_flow_control_queue_size{inference_pool="unsloth--1409d52c-a-3-1-8b-gaie"})'
+
+    - seriesQuery: 'inference_objective_running_requests'
+      resources:
+        overrides:
+          namespace: { resource: "namespace" }
+      name:
+        matches: '^inference_objective_running_requests$'
+        as:      'epp_running_requests'
+      metricsQuery: 'sum(inference_objective_running_requests{top_level_controller_name="unsloth--1409d52c-a-3-1-8b-gaie-epp"})'
+```
+
+**HPA** for each variant Deployment (primary and secondary) — identical
+metric block, only `scaleTargetRef.name` differs:
+
+```yaml
+metrics:
+  - type: External
+    external:
+      metric: { name: epp_queue_size }
+      target: { type: Value, value: "250" }
+  - type: External
+    external:
+      metric: { name: epp_running_requests }
+      target: { type: AverageValue, averageValue: "250" }
+
+behavior:
+  scaleUp:
+    stabilizationWindowSeconds: 0
+    policies: [{ type: Percent, value: 100, periodSeconds: 15 }]
+  scaleDown:
+    stabilizationWindowSeconds: 300
+    policies: [{ type: Percent, value: 100, periodSeconds: 15 }]
+```
+
+### Threshold tuning — what 250 / 250 means and when to change it
+
+The two `250`s are **literal threshold values**, not magic constants. They
+control how aggressively the HPA scales:
+
+- **`epp_queue_size = 250`** with `target.type: Value` — HPA scales to keep
+  the *total* model-level gateway queue at ≈250 requests. If the queue
+  climbs to 500, HPA wants ~2× the current replicas; if it drops to 250,
+  HPA holds.
+- **`epp_running_requests = 250`** with `target.type: AverageValue` — HPA
+  divides the metric value by *its own* current replica count. With 1
+  replica it targets 250 in-flight per pod; with 4 replicas it targets 250
+  per pod, so the model can carry 1000 concurrent before scale-up.
+
+The upstream chose `250 / 250` for Llama-3.1-8B on a 1-3 replica range.
+Our setup uses Llama-3.1-8B too, but with a 1-10 replica range and
+different load shapes. **Before running the comparison we need to verify
+that HPA actually engages under the chosen workload rate**, otherwise
+"WVA scales / HPA does not scale" is uninformative.
+
+A practical first-cut for our `prefill_heavy.yaml` at rate=5: lower
+`epp_queue_size` to ~`50–100` and keep `epp_running_requests` at `250` for
+the smoke test. In our prior WVA run at rate=5 the EPP queue peaked around
+~150, so a `250` threshold would never fire on that signal. Tune to ensure
+HPA-EPP is *active* during the run.
+
+The absolute thresholds do **not** need to match WVA's saturation config
+values (`kvCacheThreshold: 0.8`, `queueLengthThreshold: 5`) for the
+comparison to be fair — those govern WVA's internal logic, not HPA's. What
+matters is that both modes operate on the same **gateway-side signal** and
+both are actually allowed to scale during the run.
+
+### Two HPAs per pool — the structural multi-variant gap
+
+`HPA.spec.scaleTargetRef` points to a **single workload** — one Deployment,
+one StatefulSet, one LeaderWorkerSet. It cannot scale two Deployments
+coordinatedly. So with two variant Deployments we install **two HPAs**:
+
+```yaml
+# HPA #1
+spec:
+  scaleTargetRef: { kind: Deployment, name: unsloth--1409d52c-a-3-1-8b-decode }       # primary
+  metrics: [ epp_queue_size: 250, epp_running_requests: 250 ]
+
+# HPA #2
+spec:
+  scaleTargetRef: { kind: Deployment, name: unsloth--1409d52c-a-3-1-8b-decode-v2 }    # v2
+  metrics: [ epp_queue_size: 250, epp_running_requests: 250 ]   # SAME metrics
+```
+
+Both Deployments belong to the same `InferencePool` / EPP, so both rules
+return the same value at any instant. Two distinct HPAs, identical
+observation, independent decisions. This produces two structural failure
+modes that WVA explicitly fixes:
+
+1. **Both scale up together.** Queue at 500 → both HPAs want ~2× replicas
+   → primary AND v2 both add pods, even though scaling v2 alone (the
+   cheaper variant) would have sufficed. Cost-blind reaction.
+2. **`AverageValue` divides by per-Deployment replica count, not pool
+   count.** If primary=1 and v2=5, primary's HPA divides the running-count
+   by 1 and reacts immediately; v2's HPA divides by 5 and barely moves.
+   Net effect: the **expensive variant scales sooner**, the opposite of
+   what cost-aware reasoning wants.
+
+Both pathologies are direct consequences of HPA's per-Deployment scope.
+WVA reads the same signals at the *model* level and applies a cost-aware
+optimizer across variants — exactly what neither HPA can do alone.
+
+### What this changes in this proposal
+
+- The "Proposal" section's `Pods` metric on `vllm:kv_cache_usage_perc` is
+  **superseded** by the EPP-External metrics above for the comparison run.
+- The implementation artifacts (`switch_to_hpa_only_kv.py` and the
+  prometheus-adapter rule snippet) need updating to install the two
+  EPP-based rules instead of one KV-based rule, and to apply the
+  `epp_queue_size`/`epp_running_requests` HPA spec to both variant HPAs
+  rather than a `vllm_kv_cache_usage_perc` block.
+- The proposal filename retains `-kv-` for stability of any link already
+  shared, but the experiment is now an "HPA-EPP vs. WVA" comparison
+  matching upstream pattern naming.
+
+### Open questions added by this update
+
+5. **Threshold values** — start with upstream `250 / 250`, run a smoke at
+   rate=5 to confirm HPA fires, then tune down? Or pick a deliberately
+   lower starting point (e.g. `50 / 100`)?
+6. **`scaleDown` window** — upstream uses `300 s`; our prior runs used
+   `120 s`. Match upstream for fidelity, or keep `120 s` for parity with
+   our WVA-mode behavior?
+7. **`epp_running_requests` semantics** — `AverageValue` divides by *each
+   HPA's* replica count, biasing scale-up toward the variant with fewer
+   current replicas. Treat this as a known limitation of the upstream
+   pattern (it is) and document it, or attempt to mitigate with a custom
+   metric query?
