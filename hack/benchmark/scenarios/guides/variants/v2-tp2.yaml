@@ -1,0 +1,17 @@
+# Secondary variant: TP=2 on the same accelerator type, simulating
+# "different hardware shape" in a single-hardware cluster. ~2x per-pod KV
+# capacity, ~1.5-1.8x throughput, 2 GPUs per pod. Pair with a primary at
+# TP=1 / 1 GPU per pod.
+#
+# GPU budget reminder: at the maxReplicas below the peak combined GPU
+# count is `primary.maxReplicas * 1 + 4 * 2`. Make sure the cluster pool
+# can absorb that, and keep maxReplicas low enough that scaling decisions
+# are actually challenged during the run.
+suffix: v2
+variantCost: "5.0"
+minReplicas: 1
+maxReplicas: 4
+parallelism:
+  tensor: 2
+resources:
+  nvidia.com/gpu: 2
