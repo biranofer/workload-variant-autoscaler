@@ -183,6 +183,134 @@ optimizer across variants — exactly what neither HPA can do alone.
 
 ---
 
+## Extending the experiment: variant-shape diversity via TP
+
+The original two-variant scenario differs only in `variantCost` (10 vs 5).
+That demonstrates cost-aware reasoning, but both variants still have the
+same per-pod operational shape (1 GPU, TP=1, identical KV capacity). Real
+deployments often pair **operationally distinct** variants: different
+hardware, different parallelism, different KV-vs-throughput tradeoffs. To
+exercise WVA's holistic optimizer against that scenario in a
+single-hardware cluster (e.g. H100-only), the cleanest proxy is varying
+**tensor parallelism** between the two variants.
+
+### What TP differentiation simulates
+
+WVA's V2 analyzer doesn't read the GPU model name as a signal — it reads
+`variantCost`, per-pod KV capacity (`vllm:cache_config_info`), and queue /
+throughput dynamics. Anything that legitimately changes those signals
+counts as "different hardware shape" from the optimizer's perspective.
+
+| Aspect | TP=1 pod (1 GPU) | TP=2 pod (2 GPUs) |
+|---|---|---|
+| KV capacity per pod | 1× | ~2× (aggregate VRAM across 2 chips) |
+| Throughput per pod | 1× | ~1.5–1.8× (sub-linear due to all-reduce) |
+| GPU consumption per pod | 1 | 2 |
+| Natural cost weight | lower | higher |
+
+What this captures: per-pod *capacity* and *cost* differences between
+variants. What it does **not** capture: per-chip architecture differences
+(both pods are still on H100), tokenomic differences across hardware
+generations, or true cluster-inventory constraints (those are just
+`maxReplicas` regardless of TP). For the goal of stressing WVA's
+cross-variant reasoning, TP differentiation is sufficient.
+
+### Declarative variant configuration
+
+To keep the second variant's parameters reproducible and out of CLI
+arguments to `add_variant.py`, secondary-variant overrides live in a
+yaml file alongside the scenario:
+
+```
+hack/benchmark/scenarios/guides/variants/<name>.yaml
+```
+
+Schema (nested, mirroring modelservice chart values style; only
+`suffix` is required, all other keys are optional and inherit from the
+primary if omitted):
+
+```yaml
+# Required
+suffix: v2                     # secondary Deployment/VA/HPA name suffix
+
+# WVA / scaling
+variantCost: "5.0"             # default "5.0"
+minReplicas: 1                 # default 1
+maxReplicas: 4                 # default 10
+
+# vLLM model-server overrides
+parallelism:
+  tensor: 2                    # rewrites `--tensor-parallel-size`
+
+# Pod-level resource overrides
+resources:
+  nvidia.com/gpu: 2            # mirrors limits + requests
+```
+
+Two starter files ship with this proposal's implementation:
+
+- `variants/v2-cost-only.yaml` — same shape as primary, only cheaper.
+  Reproduces the original two-variant experiment.
+- `variants/v2-tp2.yaml` — TP=2 / 2 GPUs / `maxReplicas: 4` /
+  `variantCost: "5.0"`. The "different hardware shape" variant.
+
+### `add_variant.py` interface change
+
+Replace the existing four flags (`--variant-suffix`, `--variant-cost`,
+`--min-replicas`, `--max-replicas`) with a single `--config` argument
+that reads the yaml above. **Old flags are dropped, not deprecated** — a
+benchmark helper has no callers outside this repo and dropping avoids
+precedence ambiguity ("file says TP=2, flag says TP=4 — which wins?").
+
+Final CLI:
+
+```bash
+python hack/benchmark/add_variant.py \
+    --namespace $NS \
+    --config hack/benchmark/scenarios/guides/variants/v2-tp2.yaml \
+    [--dry-run]
+```
+
+Internal changes are minor (~50 LOC):
+
+- Load yaml; apply defaults for missing keys.
+- In `make_secondary_deployment`, after the existing label / selector
+  logic: if `parallelism.tensor` is set, walk every container's `args`
+  and replace any `--tensor-parallel-size N` (or append it if absent).
+  If `resources["nvidia.com/gpu"]` is set, override both `limits` and
+  `requests` on every container that already requests a GPU.
+- VA spec (`variantCost`, `minReplicas`, `maxReplicas`) reads from the
+  same config dict.
+- The existing post-apply summary log gains shape info pulled from the
+  primary Deployment's args (TP, GPU count) for both variants:
+  `Primary (cost 10.0, TP=1, 1 GPU/pod) ... Secondary (cost 5.0, TP=2, 2 GPU/pod)`.
+
+### Smoke test before the full A/B run
+
+1. `add_variant.py -n $NS --config variants/v2-tp2.yaml --dry-run` —
+   rendered Deployment shows `--tensor-parallel-size 2` and
+   `nvidia.com/gpu: 2`.
+2. Apply for real, wait for the v2 pod to become Ready (TP=2 will pull
+   in two H100s; verify the cluster has them available).
+3. End-to-end check via metrics: `vllm:cache_config_info` reported by
+   the v2 pod should have **roughly 2× the `num_gpu_blocks`** of the
+   primary pod. If it does, WVA's analyzer will see ~2× capacity for
+   v2 and the cost-aware optimizer has a meaningfully different
+   allocation problem.
+4. Run a short benchmark; v2 should absorb roughly twice the requests
+   primary does at the same KV utilization, confirming the TP scaling
+   landed.
+
+### GPU budget reminder
+
+At `maxReplicas: 8` (primary, TP=1) + `maxReplicas: 4` (v2, TP=2), peak
+demand is `8·1 + 4·2 = 16` H100s. Pick `maxReplicas` values that fit
+your cluster's pool, and small enough that scaling decisions are
+actually challenged during the run (if both variants can trivially
+absorb peak demand, neither WVA nor HPA-EPP gets exercised).
+
+---
+
 ## Why a converter script (and not a new scenario yaml)
 
 **Alternative considered (rejected):** add `guides/two-variant-hpa-epp`
@@ -261,6 +389,13 @@ restores both HPAs from the snapshot ConfigMap.
    Anyone want the orthogonal scenario yaml for clarity, even at the cost
    of duplicating ~350 lines and adding files to the upstream
    `llm-d-benchmark` repo?
+6. **TP=2 default for the v2-tp2 variant** — TP=2 fits well on a 2-GPU
+   node; TP=4 would require a 4-GPU node and shows even larger per-pod
+   capacity differences. Stay at TP=2 for the first pass, or go higher
+   if the cluster allows?
+7. **`maxReplicas` for the TP=2 variant** — proposed `4` (peak GPU =
+   8·1 + 4·2 = 16 H100s alongside primary's 8). Lower if cluster GPU
+   pool is constrained?
 
 ---
 
@@ -269,10 +404,25 @@ restores both HPAs from the snapshot ConfigMap.
 To be added in a follow-up implementation turn after this proposal is
 approved:
 
+**HPA-EPP converter (the comparison run itself):**
+
 - `hack/benchmark/switch_to_hpa_only.py` — converter, with `--revert`.
 - `hack/benchmark/scenarios/guides/hpa-epp-prometheus-adapter-rules.yaml`
   — the two External rules the script applies via `helm upgrade
   --reuse-values --values`.
+
+**Variant-shape diversity (independent of the comparison; usable in
+either WVA mode or HPA-EPP mode):**
+
+- `hack/benchmark/add_variant.py` — interface change: drop the four
+  flags (`--variant-suffix`, `--variant-cost`, `--min-replicas`,
+  `--max-replicas`) and add `--config <file>` (required). ~50 LOC of
+  override logic for `parallelism.tensor` and `resources.nvidia.com/gpu`.
+- `hack/benchmark/scenarios/guides/variants/v2-cost-only.yaml` — same
+  shape as primary, only cheaper. Reproduces the original experiment.
+- `hack/benchmark/scenarios/guides/variants/v2-tp2.yaml` — TP=2,
+  2 GPUs/pod, `maxReplicas: 4`, `variantCost: "5.0"`. The
+  "different hardware shape" variant.
 
 ---
 
