@@ -172,6 +172,15 @@ def replica_timeseries(results_dir: Path):
     return out
 
 
+def wva_target_timeseries(results_dir: Path):
+    """Optional overlay: WVA's per-variant target decisions. Returns [] if not present."""
+    p = results_dir / "metrics" / "processed" / "wva_target_timeseries.json"
+    if not p.is_file():
+        return []
+    samples = json.loads(p.read_text()).get("samples", [])
+    return [(int(s["timestamp"]), s.get("primary"), s.get("v2")) for s in samples]
+
+
 def to_dt(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
@@ -181,18 +190,30 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     drows = aggregate_decode(decode_series)
     erows = epp_panels(epp_series)
     repls = replica_timeseries(results_dir)
+    wva_targets = wva_target_timeseries(results_dir)
 
     fig, axes = plt.subplots(5, 1, figsize=(8, 11), sharex=True)
 
-    # 1. Replica Count
+    # 1. Replica Count (actual ready) + optional overlay of WVA target decisions
     ax = axes[0]
-    ax.set_title("Replica Count")
+    title = "Replica Count"
+    if wva_targets:
+        title += " — solid: ready,  dashed: WVA desired"
+    ax.set_title(title)
     if repls:
         x = [to_dt(r[0]) for r in repls]
-        ax.step(x, [r[1] for r in repls], where="post", color=PRIMARY_COLOR, label="primary", linewidth=2)
-        ax.step(x, [r[2] for r in repls], where="post", color=V2_COLOR, label="v2", linewidth=2)
+        ax.step(x, [r[1] for r in repls], where="post", color=PRIMARY_COLOR, label="primary (ready)", linewidth=2)
+        ax.step(x, [r[2] for r in repls], where="post", color=V2_COLOR, label="v2 (ready)", linewidth=2)
+    if wva_targets:
+        xt = [to_dt(t[0]) for t in wva_targets]
+        prim_t = [t[1] for t in wva_targets]
+        v2_t = [t[2] for t in wva_targets]
+        ax.step(xt, prim_t, where="post", color=PRIMARY_COLOR, linestyle="--", linewidth=1.4,
+                label="primary (WVA target)", alpha=0.8)
+        ax.step(xt, v2_t, where="post", color=V2_COLOR, linestyle="--", linewidth=1.4,
+                label="v2 (WVA target)", alpha=0.8)
     ax.set_ylabel("Replicas")
-    ax.legend(loc="upper left", fontsize=8)
+    ax.legend(loc="upper left", fontsize=7)
     ax.grid(alpha=0.3)
 
     # 2. KV Cache Utilization
