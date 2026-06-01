@@ -256,43 +256,59 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     ax.grid(alpha=0.3)
 
     # 1b. (Optional) Estimated Capacity & Demand — tokens
-    # Continuous lines come from raw-scrape estimate (always available when
-    # raw scrapes exist); WVA-analyzer numbers from the controller log are
-    # overlaid as markers when present, since they typically only cover the
-    # subset of reconciles whose log lines were still in the buffer at dump
-    # time.
+    # Stacked bars per scrape snapshot show the 3-component demand
+    # decomposition (in-use / vLLM waiting / EPP queue). Capacity is a
+    # step line on top — bars exceeding it indicate over-saturation.
+    # WVA-analyzer numbers from the controller log overlay as markers
+    # when present (typically a sparse subset of reconciles).
     if has_supply_demand:
         ax = axes[1]
-        ax.set_title("Estimated Capacity & Demand  (raw vLLM + EPP scrapes; ●  = WVA analyzer)")
+        ax.set_title("Estimated Demand (stacked) vs Capacity  "
+                     "[bars from raw vLLM+EPP scrapes; ●  = WVA analyzer]")
         if cd_est:
-            x = [to_dt(r["timestamp"]) for r in cd_est]
+            xs = [to_dt(r["timestamp"]) for r in cd_est]
+            in_use = [r["demandInUse"] for r in cd_est]
+            waiting = [r["demandWaitingPods"] for r in cd_est]
+            eppq = [r["demandEppQueue"] for r in cd_est]
             cap = [r["capacityRaw"] for r in cd_est]
-            d_in_use = [r["demandInUse"] for r in cd_est]
-            d_with_wait = [r["demandInUse"] + r["demandWaitingPods"] for r in cd_est]
-            d_total = [r["demandTotalEstimate"] for r in cd_est]
-            ax.plot(x, cap, color="black", label="capacity (Σ num_gpu_blocks·block_size)",
-                    linewidth=2)
-            ax.plot(x, d_in_use, color="#1f77b4", label="demand: in-use (KV occupancy)",
-                    linewidth=1.4)
-            ax.plot(x, d_with_wait, color="#ff7f0e", label="demand: + vLLM waiting queue",
-                    linewidth=1.4, linestyle="--")
-            ax.plot(x, d_total, color="#d62728", label="demand: + EPP queue (total est.)",
-                    linewidth=2, linestyle="-")
+            # Bar width based on sample cadence (matplotlib date units = days).
+            if len(xs) >= 2:
+                interval_sec = max(
+                    (cd_est[i + 1]["timestamp"] - cd_est[i]["timestamp"])
+                    for i in range(len(cd_est) - 1)
+                ) or 30
+                width_days = (interval_sec * 0.9) / 86400.0
+            else:
+                width_days = 15.0 / 86400.0
+            base_lower = [0.0] * len(xs)
+            base_mid = [a + b for a, b in zip(base_lower, in_use)]
+            base_top = [a + b for a, b in zip(base_mid, waiting)]
+            ax.bar(xs, in_use, width=width_days, bottom=base_lower,
+                   color="#1f77b4", edgecolor="none",
+                   label="in-use (KV occupancy)")
+            ax.bar(xs, waiting, width=width_days, bottom=base_mid,
+                   color="#ff7f0e", edgecolor="none",
+                   label="+ vLLM waiting queue")
+            ax.bar(xs, eppq, width=width_days, bottom=base_top,
+                   color="#d62728", edgecolor="none",
+                   label="+ EPP queue (gateway)")
+            ax.step(xs, cap, where="post", color="black", linewidth=2,
+                    label="capacity (Σ num_gpu_blocks·block_size)")
         if wva_sd:
-            xt = [to_dt(r[0]) for r in wva_sd]
-            sup = [r[1] for r in wva_sd if r[1] is not None]
             xs_sup = [to_dt(r[0]) for r in wva_sd if r[1] is not None]
-            dem = [r[2] for r in wva_sd if r[2] is not None]
+            sup = [r[1] for r in wva_sd if r[1] is not None]
             xs_dem = [to_dt(r[0]) for r in wva_sd if r[2] is not None]
+            dem = [r[2] for r in wva_sd if r[2] is not None]
             if sup:
-                ax.scatter(xs_sup, sup, color="black", marker="o", s=22, zorder=5,
+                ax.scatter(xs_sup, sup, color="black", marker="o", s=24, zorder=5,
                            label="WVA totalSupply")
             if dem:
-                ax.scatter(xs_dem, dem, color="#d62728", marker="o", s=22, zorder=5,
+                ax.scatter(xs_dem, dem, edgecolor="black", facecolor="#d62728",
+                           marker="o", s=24, linewidths=0.6, zorder=5,
                            label="WVA totalDemand")
         ax.set_ylabel("Tokens")
-        ax.legend(loc="upper left", fontsize=7)
-        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left", fontsize=7, ncol=2)
+        ax.grid(alpha=0.3, axis="y")
         ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
     # 2. KV Cache Utilization
