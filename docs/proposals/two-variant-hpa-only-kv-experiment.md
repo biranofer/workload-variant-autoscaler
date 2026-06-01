@@ -1,7 +1,32 @@
 # Proposal: Two-Variant HPA-only Experiment (HPA-EPP baseline)
 
-**Status:** Draft for review &nbsp;·&nbsp; **Created:** 2026-05-29 &nbsp;·&nbsp;
-**Last updated:** 2026-05-31
+**Status:** Empirical results in &nbsp;·&nbsp; **Created:** 2026-05-29 &nbsp;·&nbsp;
+**Last updated:** 2026-06-02
+
+---
+
+## TL;DR (empirical result, 25-min steady-state run, rate=5)
+
+| | WVA | HPA-EPP 50/50 | gap |
+|---|---:|---:|---:|
+| Successful (of ~7,300) | 7,033 (96.0%) | 7,191 (98.2%) | parity |
+| Mean TTFT (ms) | 1,526 | 478 | HPA faster (over-provisioned) |
+| Primary peak / v2 peak replicas | **3 / 5** | 4 / 4 | WVA caps the expensive variant |
+| Primary GPU-time (pod-seconds) | **1,724** | 3,339 | WVA uses 48% less primary capacity |
+| Cost (10·primary + 5·v2 pod-seconds) | **34,818** | 50,782 | **WVA 31% cheaper** |
+| Cost per successful request | **4.95** | 7.06 | **WVA 43% cheaper per success** |
+
+Same workload, same gateway-side signals, same HPA behavior windows — only
+the scaling brain differs. WVA's cost-aware optimizer reasons across both
+variants and pins the expensive primary at a lower replica count while
+letting v2 carry the burst capacity. HPA-EPP scales both deployments
+identically because each HPA observes only its own replicas and a
+model-level metric without variant attribution. The 31% cost gap is
+attributable directly to that cross-variant cost reasoning.
+
+(Result reproduced at smaller scale in 10-min runs from 2026-06-01; the
+25-min run widens the cost gap slightly because HPA-EPP holds at peak
+occupancy throughout instead of dipping into mid-run lulls.)
 
 ---
 
