@@ -181,6 +181,38 @@ def wva_target_timeseries(results_dir: Path):
     return [(int(s["timestamp"]), s.get("primary"), s.get("v2")) for s in samples]
 
 
+def wva_supply_demand_timeseries(results_dir: Path):
+    """WVA-side analyzer numbers (totalSupply/Demand etc.). Returns [] if absent.
+    Output rows: (ts, supply, demand, util, required, spare).
+    """
+    p = results_dir / "metrics" / "processed" / "wva_target_timeseries.json"
+    if not p.is_file():
+        return []
+    samples = json.loads(p.read_text()).get("samples", [])
+    rows = []
+    for s in samples:
+        if s.get("totalSupply") is None and s.get("totalDemand") is None:
+            continue
+        rows.append((
+            int(s["timestamp"]),
+            s.get("totalSupply"),
+            s.get("totalDemand"),
+            s.get("utilization"),
+            s.get("requiredCapacity"),
+            s.get("spareCapacity"),
+        ))
+    return rows
+
+
+def capacity_demand_estimate(results_dir: Path):
+    """Estimated capacity & 3-component demand from raw vLLM/EPP scrapes.
+    Returns [] if not present."""
+    p = results_dir / "metrics" / "processed" / "capacity_demand_estimate.json"
+    if not p.is_file():
+        return []
+    return json.loads(p.read_text()).get("samples", [])
+
+
 def to_dt(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
@@ -191,8 +223,15 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     erows = epp_panels(epp_series)
     repls = replica_timeseries(results_dir)
     wva_targets = wva_target_timeseries(results_dir)
+    wva_sd = wva_supply_demand_timeseries(results_dir)
+    cd_est = capacity_demand_estimate(results_dir)
 
-    fig, axes = plt.subplots(5, 1, figsize=(8, 11), sharex=True)
+    has_supply_demand = bool(wva_sd or cd_est)
+    n_panels = 5 + (1 if has_supply_demand else 0)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(8, 11 + (2 if has_supply_demand else 0)),
+                             sharex=True)
+    # Panel offset for the original 5 panels: 0 if no supply/demand panel, 1 otherwise.
+    base = 1 if has_supply_demand else 0
 
     # 1. Replica Count (actual ready) + optional overlay of WVA target decisions
     ax = axes[0]
@@ -216,8 +255,48 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     ax.legend(loc="upper left", fontsize=7)
     ax.grid(alpha=0.3)
 
+    # 1b. (Optional) Estimated Capacity & Demand — tokens
+    # Continuous lines come from raw-scrape estimate (always available when
+    # raw scrapes exist); WVA-analyzer numbers from the controller log are
+    # overlaid as markers when present, since they typically only cover the
+    # subset of reconciles whose log lines were still in the buffer at dump
+    # time.
+    if has_supply_demand:
+        ax = axes[1]
+        ax.set_title("Estimated Capacity & Demand  (raw vLLM + EPP scrapes; ●  = WVA analyzer)")
+        if cd_est:
+            x = [to_dt(r["timestamp"]) for r in cd_est]
+            cap = [r["capacityRaw"] for r in cd_est]
+            d_in_use = [r["demandInUse"] for r in cd_est]
+            d_with_wait = [r["demandInUse"] + r["demandWaitingPods"] for r in cd_est]
+            d_total = [r["demandTotalEstimate"] for r in cd_est]
+            ax.plot(x, cap, color="black", label="capacity (Σ num_gpu_blocks·block_size)",
+                    linewidth=2)
+            ax.plot(x, d_in_use, color="#1f77b4", label="demand: in-use (KV occupancy)",
+                    linewidth=1.4)
+            ax.plot(x, d_with_wait, color="#ff7f0e", label="demand: + vLLM waiting queue",
+                    linewidth=1.4, linestyle="--")
+            ax.plot(x, d_total, color="#d62728", label="demand: + EPP queue (total est.)",
+                    linewidth=2, linestyle="-")
+        if wva_sd:
+            xt = [to_dt(r[0]) for r in wva_sd]
+            sup = [r[1] for r in wva_sd if r[1] is not None]
+            xs_sup = [to_dt(r[0]) for r in wva_sd if r[1] is not None]
+            dem = [r[2] for r in wva_sd if r[2] is not None]
+            xs_dem = [to_dt(r[0]) for r in wva_sd if r[2] is not None]
+            if sup:
+                ax.scatter(xs_sup, sup, color="black", marker="o", s=22, zorder=5,
+                           label="WVA totalSupply")
+            if dem:
+                ax.scatter(xs_dem, dem, color="#d62728", marker="o", s=22, zorder=5,
+                           label="WVA totalDemand")
+        ax.set_ylabel("Tokens")
+        ax.legend(loc="upper left", fontsize=7)
+        ax.grid(alpha=0.3)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+
     # 2. KV Cache Utilization
-    ax = axes[1]
+    ax = axes[1 + base]
     ax.set_title("KV Cache Utilization (avg per variant)")
     if drows:
         x = [to_dt(r["ts"]) for r in drows]
@@ -229,7 +308,7 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     ax.grid(alpha=0.3)
 
     # 3. Requests Running
-    ax = axes[2]
+    ax = axes[2 + base]
     ax.set_title("Requests Running (sum per variant)")
     if drows:
         x = [to_dt(r["ts"]) for r in drows]
@@ -240,7 +319,7 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     ax.grid(alpha=0.3)
 
     # 4. Requests Waiting
-    ax = axes[3]
+    ax = axes[3 + base]
     ax.set_title("vLLM Requests Waiting (sum per variant)")
     if drows:
         x = [to_dt(r["ts"]) for r in drows]
@@ -251,7 +330,7 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     ax.grid(alpha=0.3)
 
     # 5. EPP Queue
-    ax = axes[4]
+    ax = axes[4 + base]
     ax.set_title("EPP Queue Metrics (single y-axis, all in same units)")
     if erows:
         x = [to_dt(r["ts"]) for r in erows]

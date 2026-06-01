@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Extract WVA's per-variant target replica decisions from controller logs
-within a given results dir's run window, and write them to
-``metrics/processed/wva_target_timeseries.json`` so the pipeline plot can
-overlay them.
+"""Extract WVA controller decisions and V2 saturation analysis numbers from
+the controller logs within a given results dir's run window. Output:
 
-Source signal: the controller's structured log line
-  "Applied saturation decision via shared cache" {"variant": ..., "target": N, ...}
-emitted at every reconcile (default ~30 s). One sample per reconcile per
-variant; we group by timestamp.
+  metrics/processed/wva_target_timeseries.json
+
+Captured per reconcile timestamp:
+  - per-variant `target` (from "Applied saturation decision via shared cache")
+  - model-level totalSupply / totalDemand / utilization / requiredCapacity /
+    spareCapacity (from "V2 saturation analysis completed")
+
+Both lines fire at the same reconcile, so we group by integer timestamp.
 
 Usage
 -----
@@ -29,9 +31,14 @@ except ImportError:
     sys.exit(1)
 
 
-LINE_PAT = re.compile(
+DECISION_PAT = re.compile(
     r'^(?P<ts>\S+)\t\S+\tsaturation/engine\.go:\d+\t'
     r'Applied saturation decision via shared cache\t'
+    r'(?P<json>\{.*\})$'
+)
+ANALYSIS_PAT = re.compile(
+    r'^(?P<ts>\S+)\t\S+\tsaturation/engine_v2\.go:\d+\t'
+    r'V2 saturation analysis completed\t'
     r'(?P<json>\{.*\})$'
 )
 
@@ -68,35 +75,75 @@ def main():
     ).stdout
 
     samples_by_ts = {}
-    for line in logs.splitlines():
-        m = LINE_PAT.match(line)
-        if not m:
-            continue
-        try:
-            ts_dt = parse_iso(m.group("ts"))
-        except ValueError:
-            continue
-        if ts_dt < start or ts_dt > stop:
-            continue
-        try:
-            d = json.loads(m.group("json"))
-        except json.JSONDecodeError:
-            continue
-        variant = d.get("variant", "")
-        target = d.get("target")
-        if target is None:
-            continue
-        tag = "v2" if variant.endswith("-v2") else "primary"
-        bucket = samples_by_ts.setdefault(int(ts_dt.timestamp()), {})
-        bucket[tag] = int(target)
 
-    samples = [
-        {"timestamp": ts, "primary": b.get("primary"), "v2": b.get("v2")}
-        for ts, b in sorted(samples_by_ts.items())
-    ]
+    # Bucket reconciles by integer timestamp. Some reconciles fire both
+    # "V2 saturation analysis" and per-variant "Applied decision" lines at the
+    # same wall-clock second; we want them merged into one sample.
+    def bucket(ts_dt):
+        return samples_by_ts.setdefault(int(ts_dt.timestamp()), {})
+
+    for line in logs.splitlines():
+        m = DECISION_PAT.match(line)
+        if m:
+            try:
+                ts_dt = parse_iso(m.group("ts"))
+                if ts_dt < start or ts_dt > stop:
+                    continue
+                d = json.loads(m.group("json"))
+            except (ValueError, json.JSONDecodeError):
+                continue
+            variant = d.get("variant", "")
+            target = d.get("target")
+            if target is None:
+                continue
+            tag = "v2" if variant.endswith("-v2") else "primary"
+            bucket(ts_dt)[tag] = int(target)
+            continue
+
+        m = ANALYSIS_PAT.match(line)
+        if m:
+            try:
+                ts_dt = parse_iso(m.group("ts"))
+                if ts_dt < start or ts_dt > stop:
+                    continue
+                d = json.loads(m.group("json"))
+            except (ValueError, json.JSONDecodeError):
+                continue
+            b = bucket(ts_dt)
+            for k in ("totalSupply", "totalDemand", "utilization",
+                      "requiredCapacity", "spareCapacity"):
+                if k in d:
+                    b[k] = d[k]
+
+    samples = []
+    for ts, b in sorted(samples_by_ts.items()):
+        samples.append({
+            "timestamp": ts,
+            "primary":         b.get("primary"),
+            "v2":              b.get("v2"),
+            "totalSupply":     b.get("totalSupply"),
+            "totalDemand":     b.get("totalDemand"),
+            "utilization":     b.get("utilization"),
+            "requiredCapacity": b.get("requiredCapacity"),
+            "spareCapacity":   b.get("spareCapacity"),
+        })
 
     out = rd / "metrics" / "processed" / "wva_target_timeseries.json"
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Don't clobber an existing non-empty file with zero new samples — typically
+    # means the controller log buffer rotated past the run window. Preserve
+    # whatever was previously captured.
+    if not samples and out.is_file():
+        try:
+            existing = json.loads(out.read_text()).get("samples", [])
+        except (OSError, json.JSONDecodeError):
+            existing = []
+        if existing:
+            print(f"Skipped overwriting {out}: 0 new snapshots, "
+                  f"existing file has {len(existing)}.")
+            return
+
     out.write_text(json.dumps({"samples": samples}, indent=2))
     print(f"Wrote {out} ({len(samples)} snapshots, "
           f"window {start.isoformat()} -> {stop.isoformat()})")
