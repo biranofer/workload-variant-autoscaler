@@ -1,0 +1,129 @@
+diff --git a/workload/harnesses/collect_metrics.sh b/workload/harnesses/collect_metrics.sh
+index 87f7443..d56091f 100755
+--- a/workload/harnesses/collect_metrics.sh
++++ b/workload/harnesses/collect_metrics.sh
+@@ -20,6 +20,14 @@ EPP_METRICS_PORT="${LLMDBENCH_EPP_METRICS_PORT:-9090}"  # EPP Prometheus metrics
+ EPP_METRICS_SECRET="${LLMDBENCH_EPP_METRICS_SECRET:-inference-gateway-sa-metrics-reader-secret}"  # pragma: allowlist secret
+ _EPP_AUTH_HEADER=""  # cached bearer token header for EPP scrapes
+ 
++# WVA controller exposes /metrics on HTTPS:8443 with bearer auth + a self-signed
++# cert. The SA token in workload-variant-autoscaler-controller-manager-token is
++# bound to cluster-monitoring-view; we reuse it to scrape the controller's own
++# Prometheus endpoint.
++WVA_METRICS_PORT="${LLMDBENCH_WVA_METRICS_PORT:-8443}"
++WVA_METRICS_SECRET="${LLMDBENCH_WVA_METRICS_SECRET:-workload-variant-autoscaler-controller-manager-token}"  # pragma: allowlist secret
++_WVA_AUTH_HEADER=""  # cached bearer token header for WVA scrapes
++
+ # Function to initialize metrics directory
+ init_metrics_dir() {
+     mkdir -p "$METRICS_DIR/raw" "$METRICS_DIR/processed"
+@@ -340,6 +348,83 @@ _get_epp_auth_header() {
+     echo "$_EPP_AUTH_HEADER"
+ }
+ 
++# Retrieve bearer token for the WVA controller's /metrics endpoint
++# (cached after first call). The WVA controller manager's SA token is in a
++# pre-created secret; that SA is bound to cluster-monitoring-view which grants
++# /metrics access.
++_get_wva_auth_header() {
++    if [[ -n "$_WVA_AUTH_HEADER" ]]; then
++        echo "$_WVA_AUTH_HEADER"
++        return
++    fi
++    local namespace="${LLMDBENCH_VLLM_COMMON_NAMESPACE:-default}"
++    local kubectl_cmd="${KUBECTL_CMD:-kubectl}"
++    local token
++    token=$($kubectl_cmd get secret "$WVA_METRICS_SECRET" \
++        --namespace "$namespace" \
++        -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null) || true
++    if [[ -n "$token" ]]; then
++        _WVA_AUTH_HEADER="Authorization: Bearer $token"
++    fi
++    echo "$_WVA_AUTH_HEADER"
++}
++
++# Get WVA controller pod names and IPs.
++# Output: lines of "pod_name pod_ip" pairs.
++get_wva_pod_info() {
++    local namespace="$1"
++    local kubectl_cmd="${KUBECTL_CMD:-kubectl}"
++    $kubectl_cmd --namespace "$namespace" get pods \
++        -l app.kubernetes.io/name=workload-variant-autoscaler \
++        --field-selector=status.phase=Running \
++        -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}' 2>/dev/null || true
++}
++
++# Scrape Prometheus /metrics over HTTPS with TLS verification disabled.
++# Same interface as _scrape_pod. Used for endpoints whose /metrics port is
++# served on https:// with a self-signed cert (e.g. the WVA controller).
++_scrape_pod_https() {
++    local pod_name="$1"
++    local pod_ip="$2"
++    local timestamp="$3"
++    local output_file="$4"
++    local port="$5"
++    local source_tag="$6"
++    local auth_header="${7:-}"
++    local debug_log="$METRICS_DIR/raw/collection_debug.log"
++    local tmp_file="${output_file}.tmp"
++
++    local -a curl_auth=()
++    if [[ -n "$auth_header" ]]; then
++        curl_auth=(-H "$auth_header")  # pragma: allowlist secret
++    fi
++
++    {
++        echo "# Timestamp: $timestamp"
++        echo "# Pod: $pod_name"
++        echo "# PodIP: $pod_ip"
++        echo "# Source: $source_tag"
++        echo ""
++    } > "$output_file"
++
++    local url="https://${pod_ip}:${port}${METRICS_PATH}"
++    local rc=0
++    curl -sSk --connect-timeout 5 --max-time "$METRICS_CURL_TIMEOUT" \
++        "${curl_auth[@]+"${curl_auth[@]}"}" \
++        "$url" > "$tmp_file" 2>>"$debug_log" || rc=$?
++    if [[ $rc -ne 0 ]]; then
++        echo "  [$(date -u +%H:%M:%S)] curl failed (rc=$rc) for ${pod_name} ${url}" >> "$debug_log"
++    fi
++
++    if [[ -s "$tmp_file" ]]; then
++        cat "$tmp_file" >> "$output_file"
++    else
++        echo "# Warning: Failed to collect metrics from pod $pod_name ($pod_ip)" >> "$output_file"
++    fi
++    echo "" >> "$output_file"
++    rm -f "$tmp_file"
++}
++
+ # Scrape Prometheus /metrics from a single pod.
+ # Usage: _scrape_pod <pod_name> <pod_ip> <timestamp> <output_file> <port> <source_tag> [<fallback_port>] [<auth_header>]
+ _scrape_pod() {
+@@ -459,6 +544,25 @@ collect_metrics_snapshot() {
+         done
+     fi
+ 
++    # Collect WVA controller metrics (HTTPS + bearer token, self-signed cert).
++    local wva_info
++    wva_info=$(get_wva_pod_info "$namespace")
++
++    if [[ -n "$wva_info" ]]; then
++        echo "Found WVA controller pods:"
++        echo "$wva_info"
++
++        local wva_auth
++        wva_auth=$(_get_wva_auth_header)
++
++        echo "$wva_info" | while read -r pod_name pod_ip; do
++            [[ -z "$pod_ip" || -z "$pod_name" ]] && continue
++            _scrape_pod_https "$pod_name" "$pod_ip" "$iso_timestamp" \
++                "$METRICS_DIR/raw/${pod_name}_${timestamp}_metrics.log" \
++                "$WVA_METRICS_PORT" "wva_prometheus_metrics" "$wva_auth" &
++        done
++    fi
++
+     # Wait for all background collections to finish
+     wait
+ }
