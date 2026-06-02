@@ -1,5 +1,29 @@
+diff --git a/llmdbenchmark/run/steps/step_07_deploy_harness.py b/llmdbenchmark/run/steps/step_07_deploy_harness.py
+index e8e6676..c0c1b61 100644
+--- a/llmdbenchmark/run/steps/step_07_deploy_harness.py
++++ b/llmdbenchmark/run/steps/step_07_deploy_harness.py
+@@ -661,6 +661,19 @@ class DeployHarnessStep(Step):
+ 
+         parts: list[str] = []
+ 
++        # LOCAL-FORK PATCH (workload-variant-autoscaler benchmark):
++        # The harness Docker image ships /usr/local/bin/collect_metrics.sh from
++        # the build, which the entrypoint shell scripts call directly. To pick
++        # up the configmap-mounted version (with WVA controller scraping), copy
++        # it over the image's binary before the entrypoint runs. The configmap
++        # is mounted at /workspace/harnesses; defaultMode 0755 keeps it
++        # executable.
++        parts.append(
++            "if [ -f /workspace/harnesses/collect_metrics.sh ]; then "
++            "cp /workspace/harnesses/collect_metrics.sh "
++            "/usr/local/bin/collect_metrics.sh; fi"
++        )
++
+         # Pre-compute all vars -- entrypoint uses them directly
+         parts.append(
+             f"export LLMDBENCH_RUN_EXPERIMENT_HARNESS={harness_script}"
 diff --git a/workload/harnesses/collect_metrics.sh b/workload/harnesses/collect_metrics.sh
-index 87f7443..d56091f 100755
+index 87f7443..ee84864 100755
 --- a/workload/harnesses/collect_metrics.sh
 +++ b/workload/harnesses/collect_metrics.sh
 @@ -20,6 +20,14 @@ EPP_METRICS_PORT="${LLMDBENCH_EPP_METRICS_PORT:-9090}"  # EPP Prometheus metrics
@@ -101,13 +125,26 @@ index 87f7443..d56091f 100755
  # Scrape Prometheus /metrics from a single pod.
  # Usage: _scrape_pod <pod_name> <pod_ip> <timestamp> <output_file> <port> <source_tag> [<fallback_port>] [<auth_header>]
  _scrape_pod() {
-@@ -459,6 +544,25 @@ collect_metrics_snapshot() {
+@@ -459,6 +544,39 @@ collect_metrics_snapshot() {
          done
      fi
  
 +    # Collect WVA controller metrics (HTTPS + bearer token, self-signed cert).
++    # Diagnostic: capture kubectl stderr so we can see why a query returns empty.
 +    local wva_info
++    local wva_debug="$METRICS_DIR/raw/wva_lookup_debug.log"
++    {
++        echo "[$(date -u +%H:%M:%S)] === WVA pod lookup attempt ==="
++        echo "namespace=$namespace KUBECTL_CMD=${KUBECTL_CMD:-kubectl}"
++        ${KUBECTL_CMD:-kubectl} --namespace "$namespace" get pods \
++            -l app.kubernetes.io/name=workload-variant-autoscaler \
++            --field-selector=status.phase=Running \
++            -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}' 2>&1
++        echo "[$(date -u +%H:%M:%S)] === end WVA pod lookup ==="
++    } >> "$wva_debug" 2>&1 || true
++
 +    wva_info=$(get_wva_pod_info "$namespace")
++    echo "[wva diag] wva_info='$wva_info'"
 +
 +    if [[ -n "$wva_info" ]]; then
 +        echo "Found WVA controller pods:"
@@ -115,6 +152,7 @@ index 87f7443..d56091f 100755
 +
 +        local wva_auth
 +        wva_auth=$(_get_wva_auth_header)
++        echo "[wva diag] wva_auth_set=$([[ -n \"$wva_auth\" ]] && echo yes || echo no)"
 +
 +        echo "$wva_info" | while read -r pod_name pod_ip; do
 +            [[ -z "$pod_ip" || -z "$pod_name" ]] && continue
