@@ -221,6 +221,15 @@ def epp_throughput(results_dir: Path):
     return json.loads(p.read_text()).get("samples", [])
 
 
+def wva_metrics_per_variant(results_dir: Path):
+    """Per-variant WVA Prometheus metrics over time. Returns:
+       [{ts, primary: {metric_name: value, ...}, v2: {...}, _model: {...}}, ...]"""
+    p = results_dir / "metrics" / "processed" / "wva_metrics_timeseries.json"
+    if not p.is_file():
+        return []
+    return json.loads(p.read_text()).get("samples", [])
+
+
 def to_dt(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
@@ -237,10 +246,13 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     has_supply_demand = bool(wva_sd or cd_est)
     epp_rates = epp_throughput(results_dir)
     has_rates = bool(epp_rates)
-    n_panels = 5 + (1 if has_supply_demand else 0) + (1 if has_rates else 0)
+    wva_full = wva_metrics_per_variant(results_dir)
+    has_wva_full = bool(wva_full)
+    n_extra = (1 if has_supply_demand else 0) + (1 if has_rates else 0) + (2 if has_wva_full else 0)
+    n_panels = 5 + n_extra
     fig, axes = plt.subplots(
         n_panels, 1,
-        figsize=(8, 11 + (2 if has_supply_demand else 0) + (2 if has_rates else 0)),
+        figsize=(8, 11 + 2 * n_extra),
         sharex=True,
     )
     # Panel offset for the original 5 panels: increment for each optional panel inserted before them.
@@ -385,6 +397,53 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
         ax.set_ylabel("req / s")
         ax.legend(loc="upper left", fontsize=7)
         ax.grid(alpha=0.3)
+
+    # 7. + 8. (Optional) WVA-analyzer per-variant metrics — only when the
+    # patched harness scraped the WVA controller during the run.
+    if has_wva_full:
+        x_wva = [to_dt(s["timestamp"]) for s in wva_full]
+
+        # Panel 7: per-variant wva_saturation_utilization (the analyzer's own
+        # internal "how loaded is each variant" reading; differs from the
+        # KV-only panel because it folds in queue contributions and uses the
+        # capacity-weighted formula).
+        ax = axes[5 + base + (1 if has_rates else 0)]
+        ax.set_title(
+            "WVA Saturation Utilization  (per variant, analyzer-internal)")
+        sat_pri = [s.get("primary", {}).get("wva_saturation_utilization") for s in wva_full]
+        sat_v2  = [s.get("v2", {}).get("wva_saturation_utilization") for s in wva_full]
+        ax.plot(x_wva, sat_pri, color=PRIMARY_COLOR, label="primary", linewidth=2)
+        ax.plot(x_wva, sat_v2,  color=V2_COLOR,      label="v2",      linewidth=2)
+        # Reference lines from the saturation config: 0.85 scale-up, 0.70 scale-down
+        ax.axhline(0.85, color="black", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.axhline(0.70, color="black", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.text(x_wva[-1] if x_wva else 0, 0.85, " 0.85 scaleUp",
+                fontsize=7, va="center")
+        ax.text(x_wva[-1] if x_wva else 0, 0.70, " 0.70 scaleDown",
+                fontsize=7, va="center")
+        ax.set_ylabel("utilization")
+        ax.legend(loc="upper left", fontsize=7)
+        ax.grid(alpha=0.3)
+        ax.set_ylim(bottom=0)
+
+        # Panel 8: per-variant tokens used vs capacity (analyzer view).
+        # Solid = wva_kv_cache_tokens_used, dashed = wva_kv_cache_tokens_capacity.
+        ax = axes[6 + base + (1 if has_rates else 0)]
+        ax.set_title("WVA KV Tokens In Use vs Capacity  (per variant)")
+        used_pri = [s.get("primary", {}).get("wva_kv_cache_tokens_used") for s in wva_full]
+        cap_pri  = [s.get("primary", {}).get("wva_kv_cache_tokens_capacity") for s in wva_full]
+        used_v2  = [s.get("v2", {}).get("wva_kv_cache_tokens_used") for s in wva_full]
+        cap_v2   = [s.get("v2", {}).get("wva_kv_cache_tokens_capacity") for s in wva_full]
+        ax.plot(x_wva, used_pri, color=PRIMARY_COLOR, label="primary used",     linewidth=2)
+        ax.plot(x_wva, cap_pri,  color=PRIMARY_COLOR, label="primary capacity",
+                linewidth=1.2, linestyle="--", alpha=0.7)
+        ax.plot(x_wva, used_v2,  color=V2_COLOR,      label="v2 used",          linewidth=2)
+        ax.plot(x_wva, cap_v2,   color=V2_COLOR,      label="v2 capacity",
+                linewidth=1.2, linestyle="--", alpha=0.7)
+        ax.set_ylabel("tokens")
+        ax.legend(loc="upper left", fontsize=7, ncol=2)
+        ax.grid(alpha=0.3)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=timezone.utc))
 
