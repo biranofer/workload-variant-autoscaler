@@ -213,6 +213,14 @@ def capacity_demand_estimate(results_dir: Path):
     return json.loads(p.read_text()).get("samples", [])
 
 
+def epp_throughput(results_dir: Path):
+    """Per-window request and token rates derived from EPP counters."""
+    p = results_dir / "metrics" / "processed" / "epp_throughput.json"
+    if not p.is_file():
+        return []
+    return json.loads(p.read_text()).get("samples", [])
+
+
 def to_dt(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
@@ -227,10 +235,15 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     cd_est = capacity_demand_estimate(results_dir)
 
     has_supply_demand = bool(wva_sd or cd_est)
-    n_panels = 5 + (1 if has_supply_demand else 0)
-    fig, axes = plt.subplots(n_panels, 1, figsize=(8, 11 + (2 if has_supply_demand else 0)),
-                             sharex=True)
-    # Panel offset for the original 5 panels: 0 if no supply/demand panel, 1 otherwise.
+    epp_rates = epp_throughput(results_dir)
+    has_rates = bool(epp_rates)
+    n_panels = 5 + (1 if has_supply_demand else 0) + (1 if has_rates else 0)
+    fig, axes = plt.subplots(
+        n_panels, 1,
+        figsize=(8, 11 + (2 if has_supply_demand else 0) + (2 if has_rates else 0)),
+        sharex=True,
+    )
+    # Panel offset for the original 5 panels: increment for each optional panel inserted before them.
     base = 1 if has_supply_demand else 0
 
     # 1. Replica Count (actual ready) + optional overlay of WVA target decisions
@@ -358,6 +371,20 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     ax.set_xlabel("Time (UTC)")
     ax.legend(loc="upper left", fontsize=7)
     ax.grid(alpha=0.3)
+
+    # 6. (Optional) Request rate from EPP counters
+    if has_rates:
+        ax = axes[5 + base]
+        ax.set_title("Gateway throughput  (EPP counters → finite-difference rate)")
+        x = [to_dt(s["timestamp"]) for s in epp_rates]
+        rps = [s.get("rates", {}).get("request_total_per_s", 0.0) for s in epp_rates]
+        err_ps = [s.get("rates", {}).get("request_error_total_per_s", 0.0) for s in epp_rates]
+        ax.plot(x, rps, color="black", linewidth=2, label="requests/s (offered)")
+        if any(v for v in err_ps if v):
+            ax.plot(x, err_ps, color="#d62728", linewidth=1.4, label="errors/s")
+        ax.set_ylabel("req / s")
+        ax.legend(loc="upper left", fontsize=7)
+        ax.grid(alpha=0.3)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=timezone.utc))
 

@@ -22,14 +22,20 @@ SUFFIX="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "[1/3] dump_wva_target_timeseries.py (decisions + V2 analyzer numbers)"
+echo "[1/5] dump_wva_target_timeseries.py (decisions + V2 analyzer numbers)"
 python3 "$SCRIPT_DIR/dump_wva_target_timeseries.py" "$RESULTS_DIR" -n "$NS" || \
     echo "  (skipping: log dump failed; raw-scrape estimate will still render)"
 
-echo "[2/3] dump_capacity_demand_estimate.py (raw scrape estimate)"
+echo "[2/5] dump_capacity_demand_estimate.py (raw scrape estimate)"
 python3 "$SCRIPT_DIR/dump_capacity_demand_estimate.py" "$RESULTS_DIR"
 
-echo "[3/3] plot_two_variant_pipeline.py"
+echo "[3/5] dump_epp_throughput.py (request rate from EPP counters)"
+python3 "$SCRIPT_DIR/dump_epp_throughput.py" "$RESULTS_DIR" || true
+
+echo "[4/5] dump_wva_full_timeseries.py (WVA Prometheus metrics — empty if collect_metrics.sh predates the WVA scrape patch)"
+python3 "$SCRIPT_DIR/dump_wva_full_timeseries.py" "$RESULTS_DIR" || true
+
+echo "[5/5] plot_two_variant_pipeline.py"
 if [ -n "$SUFFIX" ]; then
     python3 "$SCRIPT_DIR/plot_two_variant_pipeline.py" "$RESULTS_DIR" --suffix "$SUFFIX"
 else
@@ -39,4 +45,6 @@ fi
 echo "Done. Outputs:"
 echo "  $RESULTS_DIR/metrics/processed/wva_target_timeseries.json"
 echo "  $RESULTS_DIR/metrics/processed/capacity_demand_estimate.json"
+echo "  $RESULTS_DIR/metrics/processed/epp_throughput.json"
+echo "  $RESULTS_DIR/metrics/processed/wva_metrics_timeseries.json"
 echo "  $RESULTS_DIR/metrics/graphs/two_variant_v2_full_pipeline.png"
