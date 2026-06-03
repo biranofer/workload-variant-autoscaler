@@ -23,15 +23,27 @@ metadata:
 data:
   # Global defaults applied to all variants unless overridden
   default: |
+{{- if .Values.wva.capacityScaling.default.analyzerName }}
+    analyzerName: {{ .Values.wva.capacityScaling.default.analyzerName }}
+{{- end }}
     kvCacheThreshold: {{ .Values.wva.capacityScaling.default.kvCacheThreshold }}
     queueLengthThreshold: {{ .Values.wva.capacityScaling.default.queueLengthThreshold }}
     kvSpareTrigger: {{ .Values.wva.capacityScaling.default.kvSpareTrigger }}
     queueSpareTrigger: {{ .Values.wva.capacityScaling.default.queueSpareTrigger }}
+{{- if .Values.wva.capacityScaling.default.scaleUpThreshold }}
+    scaleUpThreshold: {{ .Values.wva.capacityScaling.default.scaleUpThreshold }}
+{{- end }}
+{{- if .Values.wva.capacityScaling.default.scaleDownBoundary }}
+    scaleDownBoundary: {{ .Values.wva.capacityScaling.default.scaleDownBoundary }}
+{{- end }}
 {{- if .Values.wva.capacityScaling.overrides }}
 {{- range $name, $override := .Values.wva.capacityScaling.overrides }}
   {{ $name }}: |
     model_id: {{ $override.modelID | quote }}
     namespace: {{ $override.namespace | quote }}
+{{- if $override.analyzerName }}
+    analyzerName: {{ $override.analyzerName }}
+{{- end }}
 {{- if $override.kvCacheThreshold }}
     kvCacheThreshold: {{ $override.kvCacheThreshold }}
 {{- end }}
@@ -43,6 +55,12 @@ data:
 {{- end }}
 {{- if $override.queueSpareTrigger }}
     queueSpareTrigger: {{ $override.queueSpareTrigger }}
+{{- end }}
+{{- if $override.scaleUpThreshold }}
+    scaleUpThreshold: {{ $override.scaleUpThreshold }}
+{{- end }}
+{{- if $override.scaleDownBoundary }}
+    scaleDownBoundary: {{ $override.scaleDownBoundary }}
 {{- end }}
 {{- end }}
 {{- end }}

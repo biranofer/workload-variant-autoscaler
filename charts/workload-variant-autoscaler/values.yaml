@@ -68,11 +68,24 @@ wva:
   capacityScaling:
     # Global defaults applied to all variants unless overridden
     default:
+      # Saturation analyzer selection.
+      # "saturation" (default) — V2 token-based analyzer: reads real KV-memory capacity
+      #                from vllm:cache_config_info, aggregates demand across running
+      #                requests, waiting queue, and EPP queue, and steers scale-up toward
+      #                the cheapest variant first.
+      # ""           — V1 percentage-based analyzer (legacy; set explicitly to opt out of V2)
+      analyzerName: saturation
+
+      # V1 thresholds (used by the default analyzer and as saturation checks in V2)
       kvCacheThreshold: 0.80      # Replica saturated if KV cache utilization >= threshold (0.0-1.0)
       queueLengthThreshold: 5     # Replica saturated if queue length >= threshold
       kvSpareTrigger: 0.1         # Scale-up if avg spare KV capacity < trigger (0.0-1.0)
       queueSpareTrigger: 3        # Scale-up if avg spare queue capacity < trigger
-    
+
+      # V2 thresholds (only used when analyzerName: saturation; controller defaults apply when 0)
+      scaleUpThreshold: 0         # Utilization fraction above which scale-up triggers (controller default: 0.85)
+      scaleDownBoundary: 0        # Utilization fraction below which scale-down is safe (controller default: 0.70)
+
     # Per-model/namespace overrides (optional)
     # Example:
     # overrides:
@@ -81,6 +94,9 @@ wva:
     #     namespace: "llm-d-autoscaler"
     #     kvCacheThreshold: 0.70
     #     kvSpareTrigger: 0.35
+    #     analyzerName: saturation   # override analyzer for this model only
+    #     scaleUpThreshold: 0.80
+    #     scaleDownBoundary: 0.65
     overrides: {}
 
 llmd:
