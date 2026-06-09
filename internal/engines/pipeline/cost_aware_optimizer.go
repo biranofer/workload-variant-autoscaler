@@ -88,6 +88,7 @@ func costAwareScaleUp(
 
 	sorted := sortByCostEfficiencyAsc(result.VariantCapacities)
 	remaining := result.RequiredCapacity
+	cheapestVC := cheapestVariantCapacity(result.VariantCapacities)
 
 	for _, vc := range sorted {
 		if remaining <= 0 {
@@ -109,6 +110,26 @@ func costAwareScaleUp(
 			if replicasNeeded > maxAdd {
 				replicasNeeded = maxAdd
 			}
+		}
+
+		// Round down if covering the overflow with cheapest replicas costs less than
+		// one additional replica of this variant. The remaining capacity will be
+		// assigned to the cheapest variant when the loop reaches it.
+		// Only applies when the cheapest variant has enough headroom to absorb the overflow.
+		if cheapestVC != nil && cheapestVC.VariantName != vc.VariantName && cheapestVC.PerReplicaCapacity > 0 {
+			overflow := remaining - float64(replicasNeeded-1)*vc.PerReplicaCapacity
+			fallbackReplicas := int(math.Ceil(overflow / cheapestVC.PerReplicaCapacity))
+			cheapestAvailable := math.MaxInt32
+			if cs := stateMap[cheapestVC.VariantName]; cs.MaxReplicas != nil && *cs.MaxReplicas > 0 {
+				cheapestAvailable = *cs.MaxReplicas - targets[cheapestVC.VariantName]
+			}
+			if fallbackReplicas <= cheapestAvailable && float64(fallbackReplicas)*cheapestVC.Cost < vc.Cost {
+				replicasNeeded--
+			}
+		}
+
+		if replicasNeeded <= 0 {
+			continue
 		}
 
 		targets[vc.VariantName] += replicasNeeded
@@ -279,6 +300,17 @@ func initTargets(states []interfaces.VariantReplicaState) map[string]int {
 		targets[s.VariantName] = s.CurrentReplicas
 	}
 	return targets
+}
+
+// cheapestVariantCapacity returns a pointer to the variant with the lowest absolute cost.
+func cheapestVariantCapacity(capacities []interfaces.VariantCapacity) *interfaces.VariantCapacity {
+	var cheapest *interfaces.VariantCapacity
+	for i := range capacities {
+		if cheapest == nil || capacities[i].Cost < cheapest.Cost {
+			cheapest = &capacities[i]
+		}
+	}
+	return cheapest
 }
 
 // sortByCostEfficiencyAsc returns variants sorted by cost/perReplicaCapacity ascending.
