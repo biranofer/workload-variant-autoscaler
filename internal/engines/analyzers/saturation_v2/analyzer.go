@@ -7,9 +7,12 @@ import (
 	"sync"
 	"time"
 
+	ctrl "sigs.k8s.io/controller-runtime"
+
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
 // SaturationAnalyzer implements the interfaces.Analyzer interface using a
@@ -183,6 +186,11 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		effectiveCapacity = k2
 	}
 
+	ctrl.Log.V(logging.DEBUG).Info("Per-replica capacity",
+		"pod", rm.PodName, "variant", rm.VariantName,
+		"k1", k1, "k2", k2, "effectiveCapacity", effectiveCapacity,
+		"tokensInUse", rm.TokensInUse, "queueLen", rm.QueueLength)
+
 	isSaturated := replicaDemand >= effectiveCapacity
 
 	// Update capacity store with live data, preserving VLLMParams from any
@@ -293,6 +301,7 @@ func (a *SaturationAnalyzer) computeK2(
 		}
 		ra.Add(float64(k2Observed))
 		a.mu.Unlock()
+		ctrl.Log.V(logging.DEBUG).Info("k2-source", "priority", 1, "source", "observed", "k2", k2Observed, "tokensInUse", tokensInUse, "queueLen", queueLen, "historyKey", historyKey)
 		return k2Observed
 	}
 
@@ -305,15 +314,18 @@ func (a *SaturationAnalyzer) computeK2(
 	}
 	a.mu.Unlock()
 	if histAvg > 0 {
+		ctrl.Log.V(logging.DEBUG).Info("k2-source", "priority", 2, "source", "history", "k2", int64(histAvg), "historyKey", historyKey)
 		return int64(histAvg)
 	}
 
 	// Priority 3: Derived from deployment args
 	if k2Derived := estimateCapacityFromParams(vllmParams, avgInput, avgOutput); k2Derived > 0 {
+		ctrl.Log.V(logging.DEBUG).Info("k2-source", "priority", 3, "source", "derived", "k2", k2Derived, "historyKey", historyKey)
 		return k2Derived
 	}
 
 	// Priority 4: Fallback to k1
+	ctrl.Log.V(logging.DEBUG).Info("k2-source", "priority", 4, "source", "fallback-k1", "k2", k1, "historyKey", historyKey)
 	return k1
 }
 
@@ -386,6 +398,17 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 		if totalCapacity > 0 {
 			utilization = totalDemand / totalCapacity
 		}
+
+		ctrl.Log.V(logging.DEBUG).Info("Variant capacity aggregated",
+			"variant", vs.VariantName, "cost", cost,
+			"perReplicaCapacity", perReplicaCapacity,
+			"readyCount", readyCount, "pendingReplicas", vs.PendingReplicas,
+			"costEfficiency", func() float64 {
+				if perReplicaCapacity > 0 {
+					return cost / perReplicaCapacity
+				}
+				return 0
+			}())
 
 		vc := interfaces.VariantCapacity{
 			VariantName:        vs.VariantName,
