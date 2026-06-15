@@ -9,6 +9,7 @@
 #   -m MODEL_ID      Model ID (default: unsloth/Meta-Llama-3.1-8B)
 #   -s SPEC          llmdbenchmark spec (default: guides/two-variant-wva)
 #   -w WORKLOAD      Scenario file in test/benchmark/scenarios/ (default: prefill_heavy.yaml)
+#   -t               Generate per-reconcile WVA decision table (requires debug image)
 #   -h               Show this help
 #
 # What this script does:
@@ -39,6 +40,7 @@ NAMESPACE=""
 MODEL_ID="unsloth/Meta-Llama-3.1-8B"
 BENCHMARK_SPEC="guides/two-variant-wva"
 BENCHMARK_WORKLOAD="prefill_heavy.yaml"
+GENERATE_TABLE=false
 
 PRIMARY_DEPLOY="unsloth--1409d52c-a-3-1-8b-decode"
 V2_DEPLOY="unsloth--1409d52c-a-3-1-8b-decode-v2"
@@ -50,12 +52,13 @@ LLMDBENCHMARK="$REPO_ROOT/llm-d-benchmark/.venv/bin/llmdbenchmark"
 WVA_LOG="/tmp/wva-debug-run.log"
 
 # ── argument parsing ──────────────────────────────────────────────────────────
-while getopts "n:m:s:w:h" opt; do
+while getopts "n:m:s:w:th" opt; do
     case $opt in
         n) NAMESPACE="$OPTARG" ;;
         m) MODEL_ID="$OPTARG" ;;
         s) BENCHMARK_SPEC="$OPTARG" ;;
         w) BENCHMARK_WORKLOAD="$OPTARG" ;;
+        t) GENERATE_TABLE=true ;;
         h) grep "^#" "$0" | grep -v "^#!/" | sed 's/^# *//' ; exit 0 ;;
         *) echo "Unknown option -$OPTARG"; exit 1 ;;
     esac
@@ -171,7 +174,12 @@ log "Results dir: $RESULTS  ($(ls "$RESULTS/metrics/raw/" 2>/dev/null | wc -l) r
 # ── step 9: post-processing ───────────────────────────────────────────────────
 log "Step 9: Running post-processing..."
 cd "$REPO_ROOT"
-python3 hack/benchmark/dump_wva_decision_table.py "$RESULTS"
+
+if [ "$GENERATE_TABLE" = true ]; then
+    log "  Generating per-reconcile decision table (requires debug image)..."
+    python3 hack/benchmark/dump_wva_decision_table.py "$RESULTS"
+fi
+
 python3 hack/benchmark/dump_capacity_demand_estimate.py "$RESULTS"
 
 # Generate wva_target_timeseries from local log
@@ -219,8 +227,13 @@ PYEOF "$RESULTS"
 python3 hack/benchmark/plot_two_variant_pipeline.py "$RESULTS"
 
 log "Done. Results:"
-log "  Table:  $RESULTS/metrics/processed/wva_decision_table.txt"
+[ "$GENERATE_TABLE" = true ] && log "  Table:  $RESULTS/metrics/processed/wva_decision_table.txt"
 log "  Graph:  $RESULTS/metrics/graphs/two_variant_v2_full_pipeline.png"
-echo ""
-log "To view the decision table:"
-echo "  cat $RESULTS/metrics/processed/wva_decision_table.txt"
+if [ "$GENERATE_TABLE" = true ]; then
+    echo ""
+    log "To view the decision table:"
+    echo "  cat $RESULTS/metrics/processed/wva_decision_table.txt"
+else
+    echo ""
+    log "Tip: re-run with -t to also generate the per-reconcile decision table."
+fi
