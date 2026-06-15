@@ -41,12 +41,12 @@ KV_USAGE = re.compile(r"^vllm:kv_cache_usage_perc\{[^}]*\}\s+([0-9.eE+-]+)")
 NUM_RUNNING = re.compile(r"^vllm:num_requests_running\{[^}]*\}\s+([0-9.eE+-]+)")
 NUM_WAITING = re.compile(r"^vllm:num_requests_waiting\{[^}]*\}\s+([0-9.eE+-]+)")
 CACHE_CFG = re.compile(
-    r'^vllm:cache_config_info\{[^}]*num_gpu_blocks="(?P<blk>[^"]+)"[^}]*'
-    r'block_size="(?P<bs>[^"]+)"[^}]*\}\s+'
+    r'^vllm:cache_config_info\{[^}]*num_gpu_blocks="(?P<blk>\d+)"[^}]*'
+    r'block_size="(?P<bs>\d+)"[^}]*\}\s+'
 )
 CACHE_CFG_ALT = re.compile(
-    r'^vllm:cache_config_info\{[^}]*block_size="(?P<bs>[^"]+)"[^}]*'
-    r'num_gpu_blocks="(?P<blk>[^"]+)"[^}]*\}\s+'
+    r'^vllm:cache_config_info\{[^}]*block_size="(?P<bs>\d+)"[^}]*'
+    r'num_gpu_blocks="(?P<blk>\d+)"[^}]*\}\s+'
 )
 EPP_QUEUE_SIZE = re.compile(
     r"^inference_extension_flow_control_queue_size\{[^}]*\}\s+([0-9.eE+-]+)"
