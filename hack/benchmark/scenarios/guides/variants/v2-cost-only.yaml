@@ -1,0 +1,11 @@
+# Secondary variant: TP=1 (1 GPU per pod), cheaper than primary TP=2.
+# Reproduces the validated two-variant experiment: WVA scales the cheaper,
+# smaller-shape variant first under load.
+suffix: v2
+variantCost: "5.0"
+minReplicas: 1
+maxReplicas: 10
+parallelism:
+  tensor: 1
+resources:
+  nvidia.com/gpu: 1
