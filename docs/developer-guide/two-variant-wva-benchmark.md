@@ -120,6 +120,37 @@ make benchmark-install
 Idempotent — re-running checks out the pinned `BENCHMARK_REPO_REF` and
 re-installs the CLI.
 
+### Cluster prerequisites — check before Step 1
+
+The standup installs `prometheus-adapter` via Helm into
+`openshift-user-workload-monitoring`. On clusters where `prometheus-adapter`
+is **already** running but **not** as a Helm release (the new
+Kustomize-based WVA install does this, as do plain `kubectl apply`
+deployments), the install fails because the cluster-scoped APIService
+`v1beta1.external.metrics.k8s.io` is owned by the non-Helm install.
+
+Run all three of these checks. If the answers match what's shown, you must
+pass `BENCHMARK_SKIP_PROMETHEUS_ADAPTER=true` to **every** `benchmark-standup`
+invocation in Step 1:
+
+```bash
+helm list -A | grep prometheus-adapter                    # → empty
+kubectl get apiservice v1beta1.external.metrics.k8s.io    # → exists
+kubectl get clusterrole prometheus-adapter-resource-reader # → NotFound
+```
+
+The flag creates a stub `prometheus-adapter-resource-reader` ClusterRole
+annotated with Helm release metadata, which makes `llmdbenchmark`'s
+existing-PA probe pass and the conflicting Helm install is skipped. The
+cluster's existing PA continues to serve `wva_desired_replicas` to your
+HPAs. Override the release-namespace annotation with
+`WVA_MONITORING_NAMESPACE=<ns>` if your PA lives somewhere other than
+`workload-variant-autoscaler-monitoring`.
+
+If all three checks return the *opposite* (no APIService, ClusterRole
+exists with Helm annotations, or a Helm release shows up), skip the flag —
+the standup will install or upgrade PA cleanly.
+
 ### Step 1 — Stand up the primary variant
 
 ```bash
@@ -148,7 +179,7 @@ make benchmark-add-variant BENCHMARK_NAMESPACE=$NS
 ```
 
 This invokes `hack/benchmark/add_variant.py` against the variant config at
-`hack/benchmark/scenarios/guides/variants/v2-cost-only.yaml` (default —
+`hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml` (default —
 override with `VARIANT_CONFIG=<path>`), creating a secondary `Deployment`,
 `VariantAutoscaling`, and `HPA` named with the `v2` suffix and
 `variantCost: "5.0"`.
@@ -267,7 +298,7 @@ controller image are both at `v0.8.0-rc5` or newer
 | Path | Role |
 |---|---|
 | `hack/benchmark/scenarios/guides/two-variant-wva.yaml` | Scenario / values for primary stack (cost 10, min/max 1/10, TP=2, HPA 100% per 15 s, vllmService enabled). Copied into the `llm-d-benchmark` checkout automatically by `make benchmark-standup`. |
-| `hack/benchmark/scenarios/guides/variants/v2-cost-only.yaml` | Default secondary-variant config (suffix `v2`, cost 5.0, TP=1) consumed by `make benchmark-add-variant`. Override path with `VARIANT_CONFIG=<path>`. |
+| `hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml` | Default secondary-variant config (suffix `v2`, cost 5.0, TP=1) consumed by `make benchmark-add-variant`. Override path with `VARIANT_CONFIG=<path>`. |
 | `hack/benchmark/add_variant.py` | Creates secondary `Deployment`/`VA`/`HPA` from primary, with the kebab-label trick. |
 | `hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml` | ConfigMap setting `analyzerName: saturation` to select V2. Applied by `make benchmark-enable-v2-saturation`. |
 | `test/benchmark/scenarios/prefill_heavy.yaml.in` | Default workload for `make benchmark-run`. |
@@ -279,7 +310,7 @@ controller image are both at `v0.8.0-rc5` or newer
 | Knob | Where | Effect |
 |---|---|---|
 | `scenario[0].wva.variantAutoscaling.variantCost` | `two-variant-wva.yaml` | Primary cost (default 10) |
-| `variantCost` field | `variants/v2-cost-only.yaml` (or other `VARIANT_CONFIG`) | Secondary cost (default 5) |
+| `variantCost` field | `variants/v2-tp1-cheaper.yaml` (or other `VARIANT_CONFIG`) | Secondary cost (default 5) |
 | `suffix` field | variant config yaml | Secondary `Deployment`/VA/HPA name suffix (default `v2`) |
 | `minReplicas` / `maxReplicas` | scenario yaml & variant config | Per-variant scaling bounds |
 | `HPA spec.behavior.scaleUp.stabilizationWindowSeconds` | live patch | 0 = follow WVA immediately; 120 = damp 2 min |
@@ -312,41 +343,8 @@ controller image are both at `v0.8.0-rc5` or newer
   `make benchmark-restart-controller BENCHMARK_NAMESPACE=$NS` between runs
   to flush it ([Step 5](#step-5--run-the-benchmark)).
 - **Standup fails at `[03] workload_monitoring` with**
-  `APIService "v1beta1.external.metrics.k8s.io" exists and cannot be imported into the current release: invalid ownership metadata`
-  → A `prometheus-adapter` is already running on the cluster but **not as
-  a Helm release** (e.g., it was installed by the new Kustomize-based WVA
-  path, or by direct `kubectl apply`). `llm-d-benchmark`'s probe for an
-  existing install only inspects Helm annotations on the
-  `prometheus-adapter-resource-reader` ClusterRole — it misses non-Helm
-  installs and tries to install another PA, which Helm refuses because the
-  cluster-scoped APIService is already owned by the non-Helm install.
-
-  Detect:
-  ```bash
-  helm list -A | grep prometheus-adapter                  # empty
-  kubectl get apiservice v1beta1.external.metrics.k8s.io  # exists
-  kubectl get clusterrole prometheus-adapter-resource-reader  # NotFound
-  ```
-
-  Workaround — pass `BENCHMARK_SKIP_PROMETHEUS_ADAPTER=true` to standup.
-  The Makefile creates a stub `prometheus-adapter-resource-reader`
-  ClusterRole annotated with Helm release metadata pointing at the
-  monitoring namespace. The standup probe then reports "prometheus-adapter
-  is already installed" and skips the conflicting install. Override the
-  release-namespace annotation with `WVA_MONITORING_NAMESPACE=<ns>` (default
-  `workload-variant-autoscaler-monitoring`) if your cluster uses a different
-  namespace for PA.
-
-  ```bash
-  make benchmark-standup BENCHMARK_NAMESPACE=$NS \
-                         BENCHMARK_SPEC=guides/two-variant-wva \
-                         BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B \
-                         BENCHMARK_SKIP_PROMETHEUS_ADAPTER=true
-  ```
-
-  The cluster's existing PA continues to serve `wva_desired_replicas` to
-  your HPAs.
-
-  This is a workaround, not a fix. The proper fix is for the scenario yaml
-  to use the Kustomize-based WVA install path (in line with the project's
-  Helm → Kustomize migration); that's tracked as a follow-up.
+  `APIService "v1beta1.external.metrics.k8s.io" exists and cannot be imported into the current release`
+  → You skipped the [Cluster prerequisites](#cluster-prerequisites--check-before-step-1)
+  check. Re-run standup with `BENCHMARK_SKIP_PROMETHEUS_ADAPTER=true`. The
+  proper long-term fix is migrating the scenario yaml to the Kustomize-based
+  WVA install path (tracked as follow-up to the Helm → Kustomize migration).

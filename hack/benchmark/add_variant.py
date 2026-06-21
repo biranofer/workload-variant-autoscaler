@@ -274,15 +274,40 @@ def _override_gpu_resources(containers, gpu_count):
 
 
 def _read_tensor_parallel(containers):
-    """Return the TP value seen in the first container that sets it, or None."""
+    """Return the TP value seen in the first container that sets it, or None.
+
+    Two forms supported:
+      1. `--tensor-parallel-size N` (or `=N`) literal in args.
+      2. `--tensor-parallel-size $VLLM_TENSOR_PARALLELISM` (or just relying on
+         the env var) — resolved against the container's env. The modelservice
+         chart uses sh -c with this env-var reference, so without this lookup
+         _override_tensor_parallel and _read_tensor_parallel both miss the
+         actual TP value.
+    """
     flag = "--tensor-parallel-size"
     for c in containers:
         args = c.get("args") or []
+        env = c.get("env") or []
+        env_tp = next(
+            (e.get("value") for e in env if e.get("name") == "VLLM_TENSOR_PARALLELISM"),
+            None,
+        )
         for i, a in enumerate(args):
             if a == flag and i + 1 < len(args):
-                return args[i + 1]
+                v = args[i + 1]
+                if isinstance(v, str) and v.startswith("$"):
+                    return env_tp
+                return v
             if isinstance(a, str) and a.startswith(flag + "="):
-                return a.split("=", 1)[1]
+                v = a.split("=", 1)[1]
+                if v.startswith("$"):
+                    return env_tp
+                return v
+        # No literal flag in args. The modelservice chart wraps everything in
+        # `sh -c "<long shell string>"`, so the flag isn't tokenised in args
+        # at all — fall back to the env var.
+        if env_tp is not None:
+            return env_tp
     return None
 
 
