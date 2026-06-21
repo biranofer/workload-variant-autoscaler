@@ -1,10 +1,14 @@
 # Two-Variant WVA Benchmark
 
-End-to-end guide for the **two-variant cost-aware scaling** benchmark: a single
-model deployed as two variants of differing `variantCost` under one shared
-`InferencePool` / EPP, used to exercise the WVA saturation V2 cost-aware
-optimizer. The cheaper variant should absorb load before the expensive one
-scales up.
+End-to-end guide for the **two-variant efficiency-aware scaling** benchmark: a
+single model deployed as two variants of differing `variantCost` under one
+shared `InferencePool` / EPP, used to exercise the WVA saturation V2 cost-aware
+optimizer. The optimizer scales the **most efficient** variant — the one with
+the best serving-capacity per unit cost — up first, not simply the cheapest.
+With the shipped pricing (primary cost 10 / TP=2, secondary cost 5 / TP=1, so
+the cost ratio equals the GPU/TP ratio) the **TP=2 primary is the more efficient
+variant** and scales up first, while the cheaper TP=1 secondary absorbs
+spillover. See the efficiency note in `variants/v2-tp1-cheaper.yaml` for why.
 
 For cluster login, namespace setup, and HuggingFace token configuration, follow
 [`benchmark-guide.md`](benchmark-guide.md) Steps 1–4 first; this document picks
@@ -270,15 +274,16 @@ on the secondary `VariantAutoscaling` and `HPA` pointing at the secondary
 
 ---
 
-## Verifying cost-aware behavior
+## Verifying efficiency-aware behavior
 
 In the controller log during sustained load you should see, ordered by
 priority:
 
-1. The cheaper variant scaling up first.
-2. The expensive variant joining only when the cheaper one's `maxReplicas`
-   cannot absorb demand alone.
-3. On scale-down, the expensive variant shrinking first.
+1. The **more efficient** variant scaling up first — the TP=2 primary at the
+   shipped 10/5 pricing.
+2. The less efficient variant joining only when the efficient one's
+   `maxReplicas` cannot absorb demand alone.
+3. On scale-down, the less efficient variant shrinking first.
 
 Sample line (taken from a real run):
 
@@ -338,10 +343,13 @@ controller image are both at `v0.8.0-rc5` or newer
   `cache_config_info` collector fixes from PR #1198), and that the model
   server image emits `vllm:cache_config_info`
   ([Required pieces #3](#3-newer-vllm-image)).
-- **Primary scales up while secondary still has headroom**
-  → Demand exceeds what the cheaper variant alone can absorb at its
-  `maxReplicas`. Raise the secondary's `maxReplicas` in the variant config
-  or lower the workload rate.
+- **Primary scales up while the secondary stays at one replica**
+  → Expected at the shipped 10/5 pricing: the TP=2 primary is the more
+  efficient variant (cost ratio == GPU/TP ratio), so the optimizer scales it
+  first and the cheaper TP=1 secondary only joins once the primary hits its
+  `maxReplicas`. To make the secondary the preferred-first variant instead,
+  price it *below* its proportional GPU share (cost ratio > TP ratio) — see
+  the efficiency note in `variants/v2-tp1-cheaper.yaml`.
 - **Stale capacity estimates after a previous run**
   → k2 history persists for the controller's lifetime. Run
   `make benchmark-restart-controller BENCHMARK_NAMESPACE=$NS` between runs
