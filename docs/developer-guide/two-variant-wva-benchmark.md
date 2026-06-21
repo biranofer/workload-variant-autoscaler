@@ -211,18 +211,22 @@ You want `Processing model (V2)`, not `(V1)`.
 
 ### Step 4 — (Optional) Tune HPA scale-up
 
-The shipped HPA has `scaleUp.stabilizationWindowSeconds: 120`. If you want
-the HPA to follow WVA decisions immediately rather than damping them:
+The shipped HPA matches the canonical WVA install samples
+(`config/samples/hpa/...`): `scaleUp.stabilizationWindowSeconds: 0`
+(immediate — the HPA follows WVA's optimizer decisions without damping)
+and `scaleDown.stabilizationWindowSeconds: 120` (windowed, to avoid
+flapping when a brief lull arrives). No patch is needed for responsive
+scaling.
+
+If you instead want to *damp* scale-up (e.g. to study the optimizer under
+a slower actuator), patch the window up:
 
 ```bash
 for hpa in unsloth--1409d52c-a-3-1-8b-decode unsloth--1409d52c-a-3-1-8b-decode-v2; do
   kubectl patch hpa -n $NS "$hpa" --type=json \
-    -p '[{"op":"replace","path":"/spec/behavior/scaleUp/stabilizationWindowSeconds","value":0}]'
+    -p '[{"op":"replace","path":"/spec/behavior/scaleUp/stabilizationWindowSeconds","value":120}]'
 done
 ```
-
-Leaving `scaleDown` windowed at 120 s prevents flapping when a brief lull
-arrives.
 
 ### Step 5 — Run the benchmark
 
@@ -313,7 +317,7 @@ controller image are both at `v0.8.0-rc5` or newer
 | `variantCost` field | `variants/v2-tp1-cheaper.yaml` (or other `VARIANT_CONFIG`) | Secondary cost (default 5) |
 | `suffix` field | variant config yaml | Secondary `Deployment`/VA/HPA name suffix (default `v2`) |
 | `minReplicas` / `maxReplicas` | scenario yaml & variant config | Per-variant scaling bounds |
-| `HPA spec.behavior.scaleUp.stabilizationWindowSeconds` | live patch | 0 = follow WVA immediately; 120 = damp 2 min |
+| `HPA spec.behavior.scaleUp.stabilizationWindowSeconds` | `two-variant-wva.yaml` (default `0`) or live patch | 0 = follow WVA immediately (shipped default, matches install samples); raise to damp |
 | `rate`, `max_seconds`, `prompt_tokens`, `output_tokens` | `prefill_heavy.yaml.in` | Workload shape |
 
 ---
