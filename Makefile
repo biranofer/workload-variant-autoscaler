@@ -420,7 +420,7 @@ benchmark-report: ## Generate a markdown table from the latest benchmark results
 	echo ""; \
 	python3 $(CURDIR)/hack/benchmark/postprocess.py $$LATEST_DIR
 
-VARIANT_CONFIG ?= $(CURDIR)/hack/benchmark/scenarios/guides/variants/v2-cost-only.yaml
+VARIANT_CONFIG ?= $(CURDIR)/hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml
 WVA_V2_SATURATION_CONFIGMAP ?= $(CURDIR)/hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml
 WVA_CONTROLLER_DEPLOY ?= deploy/workload-variant-autoscaler-controller-manager
 WVA_ROLLOUT_TIMEOUT ?= 120s
