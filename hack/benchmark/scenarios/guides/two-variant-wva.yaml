@@ -1,6 +1,6 @@
 # TWO-VARIANT WVA SCENARIO (Topology B — one shared EPP)
 #
-# Deploys the primary variant (cost 10.0) of unsloth/Meta-Llama-3.1-8B as a
+# Deploys the primary variant (cost 10.0) of unsloth/Meta-Llama-3.1-8B-Instruct as a
 # standard single-stack benchmark. A second variant at a lower cost (default
 # 5.0) is then layered on top via `make benchmark-add-variant`.
 #
@@ -43,7 +43,7 @@
 #   - The secondary Deployment uses wva.llmd.ai/variant=v2 as a unique
 #     discriminator in its own pod selector.
 #
-# Both VAs share spec.modelID = "unsloth/Meta-Llama-3.1-8B" so the WVA
+# Both VAs share spec.modelID = "unsloth/Meta-Llama-3.1-8B-Instruct" so the WVA
 # solver groups them and applies cost-weighted scaling.
 #
 # Running (two-step workflow):
@@ -113,7 +113,13 @@ shared:
   # this on the secondary Deployment to point at the v2 VA.
   modelArtifacts:
     extraLabels:
-      "llm-d.ai/variant": "unsloth--1409d52c-a-3-1-8b-decode"
+      # NOTE: this is a model-derived value (the literal = <model_id_label>-decode
+      # for the default model above). It is NOT consumed by the saturation-V2
+      # collector (verified: a run with a different -m carried this stale value
+      # and V2 still mapped/scaled correctly), so it is metadata only. Keep it in
+      # sync with the default model, or template/drop it when the scenario config
+      # gains jinja support.
+      "llm-d.ai/variant": "unsloth--6b24a594-instruct-decode"
 
   chartVersions:
     wva: 0.8.0-rc5
@@ -269,11 +275,16 @@ shared:
 scenario:
   - name: "llama-8b"
 
+    # Default model is an INSTRUCT (chat-templated) model. On llm-d-benchmark
+    # >= v0.7.0 the decode image ships transformers >= 4.44, which rejects a
+    # model whose tokenizer defines no chat template (i.e. base models) with
+    # ChatTemplateResolutionError. Override with -m / BENCHMARK_MODEL_ID, but
+    # only with another chat-templated model (or supply --chat-template).
     model:
-      name: unsloth/Meta-Llama-3.1-8B
-      shortName: unsloth-meta-llama-3-1-8b
-      path: models/unsloth/Meta-Llama-3.1-8B
-      huggingfaceId: unsloth/Meta-Llama-3.1-8B
+      name: unsloth/Meta-Llama-3.1-8B-Instruct
+      shortName: unsloth-meta-llama-3-1-8b-instruct
+      path: models/unsloth/Meta-Llama-3.1-8B-Instruct
+      huggingfaceId: unsloth/Meta-Llama-3.1-8B-Instruct
       size: 32Gi
       maxModelLen: 8192
       blockSize: 64
