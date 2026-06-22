@@ -160,8 +160,17 @@ the standup will install or upgrade PA cleanly.
 ```bash
 make benchmark-standup BENCHMARK_NAMESPACE=$NS \
                        BENCHMARK_SPEC=guides/two-variant-wva \
-                       BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B
+                       BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B-Instruct
 ```
+
+> **Model requirement — must be chat-template-bearing.** Use an
+> instruct/chat-tuned model (the scenario default is
+> `unsloth/Meta-Llama-3.1-8B-Instruct`). On llm-d-benchmark ≥ v0.7.0 the
+> decode image ships transformers ≥ 4.44, which **rejects a model whose
+> tokenizer defines no chat template** (i.e. base models such as
+> `unsloth/Meta-Llama-3.1-8B`) with `ChatTemplateResolutionError`, and every
+> request errors. To use a base model anyway, supply `--chat-template` or
+> pin a transformers-< 4.44 decode image.
 
 `benchmark-standup` copies two files into the `llm-d-benchmark` checkout:
 
@@ -192,7 +201,7 @@ Verify both VAs and HPAs are present:
 
 ```bash
 kubectl get va,hpa -n $NS
-kubectl get pods -n $NS -l 'llm-d.ai/inferenceServing=true,llm-d.ai/model=unsloth--1409d52c-a-3-1-8b'
+kubectl get pods -n $NS -l 'llm-d.ai/inferenceServing=true,llm-d.ai/model=unsloth--6b24a594-instruct'
 ```
 
 ### Step 3 — Enable saturation V2
@@ -226,7 +235,7 @@ If you instead want to *damp* scale-up (e.g. to study the optimizer under
 a slower actuator), patch the window up:
 
 ```bash
-for hpa in unsloth--1409d52c-a-3-1-8b-decode unsloth--1409d52c-a-3-1-8b-decode-v2; do
+for hpa in unsloth--6b24a594-instruct-decode unsloth--6b24a594-instruct-decode-v2; do
   kubectl patch hpa -n $NS "$hpa" --type=json \
     -p '[{"op":"replace","path":"/spec/behavior/scaleUp/stabilizationWindowSeconds","value":120}]'
 done
@@ -289,7 +298,7 @@ Sample line (taken from a real run):
 
 ```
 saturation/engine_v2.go:65   V2 saturation analysis completed
-  modelID=unsloth/Meta-Llama-3.1-8B totalSupply=2503400 totalDemand=2229945
+  modelID=unsloth/Meta-Llama-3.1-8B-Instruct totalSupply=2503400 totalDemand=2229945
   utilization=0.89 requiredCapacity=120065 spareCapacity=0
 ```
 
