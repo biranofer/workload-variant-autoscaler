@@ -69,6 +69,29 @@ func (o *CostAwareOptimizer) Optimize(
 		logger.V(logging.DEBUG).Info("Cost-aware optimizer decisions",
 			"modelID", req.ModelID,
 			"decisions", len(decisions))
+		// Per-variant scaling decision with the cost-efficiency that drove the pick
+		// (lowest cost/perReplicaCapacity is scaled up first).
+		for _, d := range decisions {
+			vc := vcMap[d.VariantName]
+			var costEfficiency float64
+			if vc.PerReplicaCapacity > 0 {
+				costEfficiency = vc.Cost / vc.PerReplicaCapacity
+			}
+			scaleDelta := d.TargetReplicas - d.CurrentReplicas
+			logger.V(logging.DEBUG).Info("V2 decision",
+				"modelID", req.ModelID,
+				"variant", d.VariantName,
+				"role", d.Role,
+				"current", d.CurrentReplicas,
+				"target", d.TargetReplicas,
+				"delta", scaleDelta,
+				"cost", vc.Cost,
+				"perReplicaCapacity", vc.PerReplicaCapacity,
+				"costEfficiency", costEfficiency,
+				"action", d.Action,
+				"reason", d.Reason(),
+			)
+		}
 		allDecisions = append(allDecisions, decisions...)
 	}
 

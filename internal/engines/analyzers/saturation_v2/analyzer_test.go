@@ -3,6 +3,7 @@ package saturation_v2
 import (
 	"context"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -1015,7 +1016,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).To(BeNil())
 	})
 
@@ -1031,7 +1032,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			KvCacheUsage: 0.5,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).To(BeNil())
 	})
 
@@ -1051,7 +1052,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 (KvCacheThreshold) = 8000
 		Expect(result.EffectiveCapacity).To(Equal(int64(8000)))
@@ -1075,7 +1076,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 1.0 * 8000 = 8000 >= 8000
@@ -1100,7 +1101,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 0.9 * 8000 = 7200
@@ -1129,7 +1130,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			AvgInputTokens:        500,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 0.5 * 8000 + 3 * 500 = 4000 + 1500 = 5500
@@ -1154,7 +1155,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			AvgInputTokens:        0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 0.3 * 8000 = 2400 (no queue contribution)
@@ -1176,7 +1177,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", logr.Discard())
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		Expect(result.PodName).To(Equal("pod-1"))

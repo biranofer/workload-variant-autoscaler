@@ -7,9 +7,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
+	ctrl "sigs.k8s.io/controller-runtime"
+
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/aggregation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
 // SaturationAnalyzer implements the interfaces.Analyzer interface using a
@@ -65,6 +69,8 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input interfaces.Analy
 		return nil, fmt.Errorf("expected *SaturationScalingConfig, got %T", input.Config)
 	}
 
+	logger := ctrl.LoggerFrom(ctx).WithName("saturation-v2").WithValues("modelID", input.ModelID, "namespace", input.Namespace)
+
 	// Build GPU count lookup from variant states
 	gpusByVariant := make(map[string]int, len(input.VariantStates))
 	for _, vs := range input.VariantStates {
@@ -80,14 +86,14 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input interfaces.Analy
 		default:
 		}
 		gpuCount := gpusByVariant[rm.VariantName]
-		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount)
+		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount, logger)
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
 	}
 
 	// Phase 2: Per-variant aggregation
-	variantCapacities := a.aggregateByVariant(replicaCapacities, input.ReplicaMetrics, input.VariantStates, input.ModelID, input.Namespace, satConfig.KvCacheThreshold)
+	variantCapacities := a.aggregateByVariant(replicaCapacities, input.ReplicaMetrics, input.VariantStates, input.ModelID, input.Namespace, satConfig.KvCacheThreshold, logger)
 
 	// Phase 3: Model-level aggregation via shared helpers (enforces linearity invariant).
 	totalSupply := aggregation.SumTotalSupply(variantCapacities)
@@ -144,6 +150,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	config *config.SaturationScalingConfig,
 	modelID, namespace string,
 	gpuCount int,
+	logger logr.Logger,
 ) *ReplicaCapacity {
 	if rm.TotalKvCapacityTokens <= 0 {
 		// TODO: implement proper demand estimation when vllm:cache_config_info is absent.
@@ -151,7 +158,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		// capacity from the capacity store. A better approach would be to estimate
 		// TotalKvCapacityTokens from deployment args (num_gpu_blocks_override, block_size)
 		// or use a dedicated percentage-based demand signal.
-		return a.computeReplicaCapacityFallback(rm, config, modelID, namespace)
+		return a.computeReplicaCapacityFallback(rm, config, modelID, namespace, logger)
 	}
 
 	// Compute demand
@@ -168,7 +175,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	if rec := a.capacityStore.Get(namespace, modelID, rm.VariantName); rec != nil {
 		vllmParams = rec.VLLMParams
 	}
-	k2 := a.computeK2(
+	k2, k2Source, historyKey, histAvg := a.computeK2(
 		modelID, rm.AcceleratorName,
 		gpuCount,
 		rm.QueueLength, rm.TokensInUse,
@@ -179,11 +186,33 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	)
 
 	effectiveCapacity := k1
+	capacityBound := "k1-memory"
 	if k2 < k1 {
 		effectiveCapacity = k2
+		capacityBound = "k2-compute"
 	}
 
 	isSaturated := replicaDemand >= effectiveCapacity
+
+	logger.V(logging.DEBUG).Info("V2 k2 calc",
+		"variant", rm.VariantName,
+		"pod", rm.PodName,
+		"gpuCount", gpuCount,
+		"historyKey", historyKey,
+		"queueLen", rm.QueueLength,
+		"queueThreshold", config.QueueLengthThreshold,
+		"tokensInUse", rm.TokensInUse,
+		"avgInput", rm.AvgInputTokens,
+		"avgOutput", rm.AvgOutputTokens,
+		"k1", k1,
+		"k2", k2,
+		"k2Source", k2Source,
+		"histAvg", histAvg,
+		"effectiveCapacity", effectiveCapacity,
+		"capacityBound", capacityBound,
+		"replicaDemand", replicaDemand,
+		"isSaturated", isSaturated,
+	)
 
 	// Update capacity store with live data, preserving VLLMParams from any
 	// existing record (parsed from deployment args and needed for FindCompatible).
@@ -225,9 +254,12 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 	rm interfaces.ReplicaMetrics,
 	cfg *config.SaturationScalingConfig,
 	modelID, namespace string,
+	logger logr.Logger,
 ) *ReplicaCapacity {
 	rec := a.capacityStore.Get(namespace, modelID, rm.VariantName)
 	if rec == nil || rec.EffectiveCapacity <= 0 {
+		logger.V(logging.DEBUG).Info("V2 k2 calc (fallback): no usable capacity record",
+			"variant", rm.VariantName, "pod", rm.PodName, "kvCacheUsage", rm.KvCacheUsage)
 		return nil
 	}
 
@@ -251,6 +283,18 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 
 	isSaturated := replicaDemand >= effectiveCapacity
 
+	logger.V(logging.DEBUG).Info("V2 k2 calc (fallback: no cache_config_info)",
+		"variant", rm.VariantName,
+		"pod", rm.PodName,
+		"kvCacheUsage", rm.KvCacheUsage,
+		"queueLen", rm.QueueLength,
+		"avgInput", rm.AvgInputTokens,
+		"storedEffectiveCapacity", rec.EffectiveCapacity,
+		"effectiveCapacity", effectiveCapacity,
+		"replicaDemand", replicaDemand,
+		"isSaturated", isSaturated,
+	)
+
 	return &ReplicaCapacity{
 		PodName:               rm.PodName,
 		VariantName:           rm.VariantName,
@@ -270,6 +314,10 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 // 2. Historical → rolling average from previous observations
 // 3. Derived (from deployment args) → formula-based estimate
 // 4. Fallback → k1 (memory-bound only)
+//
+// Returns the chosen k2, the source branch ("observed"|"historical"|"derived"|"fallback"),
+// the rolling-average history key, and the current historical average (0 if none) — the
+// latter two for debug logging so the scaling decision is explainable.
 func (a *SaturationAnalyzer) computeK2(
 	modelID, accelerator string,
 	gpuCount int,
@@ -278,9 +326,9 @@ func (a *SaturationAnalyzer) computeK2(
 	queueThreshold float64,
 	vllmParams *VLLMEngineParams,
 	k1 int64,
-) int64 {
+) (k2 int64, source string, historyKey string, histAvg float64) {
 	outputBucket := classifyOutputLength(avgOutput)
-	historyKey := fmt.Sprintf("%s|%s|%d|%s", modelID, accelerator, gpuCount, outputBucket)
+	historyKey = fmt.Sprintf("%s|%s|%d|%s", modelID, accelerator, gpuCount, outputBucket)
 
 	// Priority 1: Observed (queue saturated)
 	if queueLen >= int(queueThreshold) && tokensInUse > 0 {
@@ -292,29 +340,29 @@ func (a *SaturationAnalyzer) computeK2(
 			a.computeCapacityHistory[historyKey] = ra
 		}
 		ra.Add(float64(k2Observed))
+		histAvg = ra.Average()
 		a.mu.Unlock()
-		return k2Observed
+		return k2Observed, "observed", historyKey, histAvg
 	}
 
 	// Priority 2: Historical — lock must cover Average() since Add() mutates
 	// the same slice from Priority 1 under the same lock.
 	a.mu.Lock()
-	var histAvg float64
 	if ra, ok := a.computeCapacityHistory[historyKey]; ok {
 		histAvg = ra.Average()
 	}
 	a.mu.Unlock()
 	if histAvg > 0 {
-		return int64(histAvg)
+		return int64(histAvg), "historical", historyKey, histAvg
 	}
 
 	// Priority 3: Derived from deployment args
 	if k2Derived := estimateCapacityFromParams(vllmParams, avgInput, avgOutput); k2Derived > 0 {
-		return k2Derived
+		return k2Derived, "derived", historyKey, histAvg
 	}
 
 	// Priority 4: Fallback to k1
-	return k1
+	return k1, "fallback", historyKey, histAvg
 }
 
 // aggregateByVariant groups replica capacities by variant and computes
@@ -325,6 +373,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 	variantStates []interfaces.VariantReplicaState,
 	modelID, namespace string,
 	kvCacheThreshold float64,
+	logger logr.Logger,
 ) []interfaces.VariantCapacity {
 	// Group replicas by variant
 	byVariant := make(map[string][]ReplicaCapacity)
@@ -399,6 +448,26 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 			TotalDemand:        totalDemand,
 			Utilization:        utilization,
 		}
+
+		// cost-efficiency = cost per unit of per-replica capacity; the optimizer
+		// scales up the variant with the LOWEST value first (most capacity per cost).
+		var costEfficiency float64
+		if perReplicaCapacity > 0 {
+			costEfficiency = cost / perReplicaCapacity
+		}
+		logger.V(logging.DEBUG).Info("V2 variant capacity",
+			"variant", vs.VariantName,
+			"role", vs.Role,
+			"readyReplicas", readyCount,
+			"pendingReplicas", vs.PendingReplicas,
+			"perReplicaCapacity", perReplicaCapacity,
+			"cost", cost,
+			"costEfficiency", costEfficiency,
+			"totalCapacity", totalCapacity,
+			"totalDemand", totalDemand,
+			"utilization", utilization,
+		)
+
 		result = append(result, vc)
 	}
 
