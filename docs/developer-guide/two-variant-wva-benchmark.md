@@ -252,12 +252,17 @@ For multi-run comparisons, restart the controller between runs to flush k2
 history (otherwise stale per-replica capacity estimates from the previous
 run can poison the next):
 
+`BENCHMARK_MODEL_ID` must be passed to `benchmark-run` as well — without it
+the CLI defaults to `e2ewva/dummy-model` and fails model verification.
+
 ```bash
 make benchmark-restart-controller BENCHMARK_NAMESPACE=$NS
-make benchmark-run BENCHMARK_NAMESPACE=$NS BENCHMARK_SPEC=guides/two-variant-wva
+make benchmark-run BENCHMARK_NAMESPACE=$NS BENCHMARK_SPEC=guides/two-variant-wva \
+                   BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B-Instruct
 # Override workload:
 make benchmark-run BENCHMARK_NAMESPACE=$NS BENCHMARK_SPEC=guides/two-variant-wva \
-     BENCHMARK_WORKLOAD=symmetrical.yaml
+                   BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B-Instruct \
+                   BENCHMARK_WORKLOAD=symmetrical.yaml
 ```
 
 Each run produces a workspace under `$REPO/biran-<timestamp>/...` with raw

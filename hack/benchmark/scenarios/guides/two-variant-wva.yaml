@@ -6,7 +6,7 @@
 #
 # Both variants register their pods into the SAME InferencePool / EPP so the
 # WVA saturation solver can compare their costs under a unified queue-depth
-# signal and scale the cheaper variant first.
+# signal and scale the more efficient variant first.
 #
 # Topology:
 #
