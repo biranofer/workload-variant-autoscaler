@@ -408,6 +408,7 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@echo "  Generating benchmark report..."
 	@echo "========================================="
 	@$(MAKE) benchmark-report
+	@$(MAKE) benchmark-plot-two-variant || true
 
 .PHONY: benchmark-report
 benchmark-report: ## Generate a markdown table from the latest benchmark results
@@ -419,6 +420,23 @@ benchmark-report: ## Generate a markdown table from the latest benchmark results
 	echo "Results directory: $$LATEST_DIR"; \
 	echo ""; \
 	python3 $(CURDIR)/hack/benchmark/postprocess.py $$LATEST_DIR
+
+BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX ?= v2
+BENCHMARK_TWO_VARIANT_GPUS_PRIMARY ?= 2
+BENCHMARK_TWO_VARIANT_GPUS_SECONDARY ?= 1
+
+.PHONY: benchmark-plot-two-variant
+benchmark-plot-two-variant: ## Plot two-variant replica/latency/throughput graph from the latest results (no-op for single-variant runs)
+	@LATEST_DIR=$$(ls -td $(BENCHMARK_WORKSPACE)/$${USER}-*/results/$(BENCHMARK_HARNESS)-*_* 2>/dev/null | head -1); \
+	if [ -z "$$LATEST_DIR" ]; then \
+		echo "No benchmark results found, skipping two-variant plot"; \
+		exit 0; \
+	fi; \
+	python3 $(CURDIR)/hack/benchmark/plot_two_variant.py \
+		--secondary-suffix $(BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX) \
+		-o $$LATEST_DIR/two_variant_plot.png \
+		$$LATEST_DIR && \
+	echo "Two-variant plot: $$LATEST_DIR/two_variant_plot.png"
 
 VARIANT_CONFIG ?= $(CURDIR)/hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml
 WVA_V2_SATURATION_CONFIGMAP ?= $(CURDIR)/hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml
