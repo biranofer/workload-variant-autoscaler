@@ -419,11 +419,17 @@ benchmark-report: ## Generate a markdown table from the latest benchmark results
 	fi; \
 	echo "Results directory: $$LATEST_DIR"; \
 	echo ""; \
-	python3 $(CURDIR)/hack/benchmark/postprocess.py $$LATEST_DIR
+	if [ -n "$(BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX)" ]; then \
+		python3 $(CURDIR)/hack/benchmark/postprocess.py \
+			--secondary-suffix $(BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX) \
+			--scenario-yaml $(CURDIR)/hack/benchmark/scenarios/$(BENCHMARK_SPEC).yaml \
+			--variant-config $(VARIANT_CONFIG) \
+			$$LATEST_DIR; \
+	else \
+		python3 $(CURDIR)/hack/benchmark/postprocess.py $$LATEST_DIR; \
+	fi
 
 BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX ?= v2
-BENCHMARK_TWO_VARIANT_GPUS_PRIMARY ?= 2
-BENCHMARK_TWO_VARIANT_GPUS_SECONDARY ?= 1
 
 .PHONY: benchmark-plot-two-variant
 benchmark-plot-two-variant: ## Plot two-variant replica/latency/throughput graph from the latest results (no-op for single-variant runs)
@@ -432,11 +438,9 @@ benchmark-plot-two-variant: ## Plot two-variant replica/latency/throughput graph
 		echo "No benchmark results found, skipping two-variant plot"; \
 		exit 0; \
 	fi; \
-	python3 $(CURDIR)/hack/benchmark/plot_two_variant.py \
-		--secondary-suffix $(BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX) \
-		-o $$LATEST_DIR/two_variant_plot.png \
+	python3 $(CURDIR)/hack/benchmark/plot_two_variant_pipeline.py \
 		$$LATEST_DIR && \
-	echo "Two-variant plot: $$LATEST_DIR/two_variant_plot.png"
+	echo "Two-variant plot: $$LATEST_DIR/metrics/graphs/two_variant_v2_full_pipeline.png"
 
 VARIANT_CONFIG ?= $(CURDIR)/hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml
 WVA_V2_SATURATION_CONFIGMAP ?= $(CURDIR)/hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml

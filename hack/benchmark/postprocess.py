@@ -26,6 +26,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from statistics import mean
 
@@ -56,6 +57,18 @@ def _variant_metrics(primary_label, secondary_label):
         "Avg pod startup (s)",
         "Cost (weighted avg replicas × GPU/hr)",
     ]
+
+
+def _read_tensor_from_yaml(yaml_path):
+    """Return the first `tensor: N` value found in a YAML file, or 1 if absent."""
+    if not yaml_path or not os.path.isfile(yaml_path):
+        return 1
+    with open(yaml_path) as f:
+        for line in f:
+            m = re.match(r'\s*tensor:\s*(\d+)', line)
+            if m:
+                return int(m.group(1))
+    return 1
 
 
 def _parse_prometheus_value(line, metric_name):
@@ -153,7 +166,7 @@ def _extract_variant_replica_stats(results_dir, secondary_suffix):
             ready = c.get("ready_replicas", 0) or 0
             if "decode" not in name:
                 continue
-            if name.endswith(f"-{secondary_suffix}"):
+            if f"-{secondary_suffix}" in name:
                 s += ready
             else:
                 p += ready
@@ -350,11 +363,14 @@ def main():
                     help="Label for the primary variant in table rows (default: primary)")
     ap.add_argument("--secondary-label", type=str, default="secondary",
                     help="Label for the secondary variant in table rows (default: secondary)")
-    ap.add_argument("--gpus-per-primary", type=int, default=1,
-                    help="GPU count per primary replica, used for weighted cost (default: 1)")
-    ap.add_argument("--gpus-per-secondary", type=int, default=1,
-                    help="GPU count per secondary replica, used for weighted cost (default: 1)")
+    ap.add_argument("--scenario-yaml", type=str, default=None,
+                    help="Path to the primary scenario YAML; tensor: value sets gpus-per-primary")
+    ap.add_argument("--variant-config", type=str, default=None,
+                    help="Path to the secondary variant config YAML; tensor: value sets gpus-per-secondary")
     args = ap.parse_args()
+
+    gpus_per_primary = _read_tensor_from_yaml(args.scenario_yaml)
+    gpus_per_secondary = _read_tensor_from_yaml(args.variant_config)
 
     metrics = (
         _variant_metrics(args.primary_label, args.secondary_label)
@@ -372,8 +388,8 @@ def main():
         runs.append(process_one(
             d,
             secondary_suffix=args.secondary_suffix,
-            gpus_per_primary=args.gpus_per_primary,
-            gpus_per_secondary=args.gpus_per_secondary,
+            gpus_per_primary=gpus_per_primary,
+            gpus_per_secondary=gpus_per_secondary,
             primary_label=args.primary_label,
             secondary_label=args.secondary_label,
         ))

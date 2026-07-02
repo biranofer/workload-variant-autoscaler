@@ -255,18 +255,76 @@ run can poison the next):
 `BENCHMARK_MODEL_ID` must be passed to `benchmark-run` as well — without it
 the CLI defaults to `e2ewva/dummy-model` and fails model verification.
 
+Pass `BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX=v2` to enable two-variant
+post-processing (per-variant replica rows, weighted cost column, and a
+full-pipeline PNG plot). The GPU counts for the cost formula are read automatically
+from the scenario and variant config YAMLs (`tensor:` field).
+
 ```bash
 make benchmark-restart-controller BENCHMARK_NAMESPACE=$NS
 make benchmark-run BENCHMARK_NAMESPACE=$NS BENCHMARK_SPEC=guides/two-variant-wva \
-                   BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B-Instruct
+                   BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B-Instruct \
+                   BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX=v2
 # Override workload:
 make benchmark-run BENCHMARK_NAMESPACE=$NS BENCHMARK_SPEC=guides/two-variant-wva \
                    BENCHMARK_MODEL_ID=unsloth/Meta-Llama-3.1-8B-Instruct \
+                   BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX=v2 \
                    BENCHMARK_WORKLOAD=symmetrical.yaml
 ```
 
-Each run produces a workspace under `$REPO/biran-<timestamp>/...` with raw
+Each run produces a workspace under `$REPO/$USER-<timestamp>/...` with raw
 metrics, logs, and processed timeseries.
+
+### Step 5a — Post-run output
+
+When `BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX=v2` is set, `benchmark-run`
+automatically produces two outputs after the run completes:
+
+**Markdown table** (printed to stdout, copy-paste into `docs/benchmark.md`):
+
+```
+| Metric                                | Run 1 |
+|---------------------------------------|-------|
+| P99 TTFT (ms)                         | 601   |
+| P99 ITL (ms/token)                    | 6.2   |
+| Avg primary replicas                  | 5.84  |
+| Max primary replicas                  | 10    |
+| Avg secondary replicas                | 2.31  |
+| Max secondary replicas                | 8     |
+| Avg KV cache utilization              | 71.3% |
+| Avg queue depth (EPP)                 | 12.4  |
+| Error count                           | 0     |
+| Avg pod startup (s)                   | 118   |
+| Cost (weighted avg replicas × GPU/hr) | 14.31 |
+```
+
+The cost is `(primary_avg × 2 + secondary_avg × 1)` — weighted by TP (GPU)
+count, read from the scenario and variant config YAMLs so no manual input
+is needed.
+
+**Full-pipeline PNG plot** saved to `<results-dir>/metrics/graphs/two_variant_v2_full_pipeline.png`.
+Panels (up to 7, optional panels appear when data is present):
+1. Replica count — ready (solid) + WVA desired (dashed) per variant
+2. Estimated demand (stacked: in-use / vLLM waiting / EPP queue) vs capacity
+3. KV cache utilisation (avg per variant)
+4. Requests running (sum per variant)
+5. vLLM requests waiting (sum per variant)
+6. EPP queue metrics (flow-control queue, pool average, per-variant per-pod sum)
+7. Gateway throughput (requests/s and errors/s from EPP counters)
+
+To regenerate either output against an older results directory:
+
+```bash
+# Markdown table:
+python3 hack/benchmark/postprocess.py \
+    --secondary-suffix v2 \
+    --scenario-yaml hack/benchmark/scenarios/guides/two-variant-wva.yaml \
+    --variant-config hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml \
+    <results-dir>
+
+# Plot:
+python3 hack/benchmark/plot_two_variant_pipeline.py <results-dir>
+```
 
 ### Step 6 — Teardown
 
@@ -323,6 +381,8 @@ controller image are both at `v0.8.0-rc5` or newer
 | `hack/benchmark/scenarios/guides/two-variant-wva.yaml` | Scenario / values for primary stack (cost 10, min/max 1/10, TP=2, HPA 100% per 15 s, vllmService enabled). Copied into the `llm-d-benchmark` checkout automatically by `make benchmark-standup`. |
 | `hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml` | Default secondary-variant config (suffix `v2`, cost 5.0, TP=1) consumed by `make benchmark-add-variant`. Override path with `VARIANT_CONFIG=<path>`. |
 | `hack/benchmark/add_variant.py` | Creates secondary `Deployment`/`VA`/`HPA` from primary, with the kebab-label trick. |
+| `hack/benchmark/postprocess.py` | Generates a markdown results table (matching `docs/benchmark.md`) from a results directory. Called automatically by `make benchmark-report`. Pass `--secondary-suffix v2` for per-variant replica rows and weighted cost. |
+| `hack/benchmark/plot_two_variant_pipeline.py` | Generates the full-pipeline PNG (up to 7 panels: replicas, capacity/demand, KV cache, requests running/waiting, EPP queue, gateway throughput). Called automatically by `make benchmark-plot-two-variant`. |
 | `hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml` | ConfigMap setting `analyzerName: saturation` to select V2. Applied by `make benchmark-enable-v2-saturation`. |
 | `test/benchmark/scenarios/prefill_heavy.yaml.in` | Default workload for `make benchmark-run`. |
 
