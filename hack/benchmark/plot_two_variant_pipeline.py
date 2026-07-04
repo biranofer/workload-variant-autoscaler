@@ -95,7 +95,7 @@ def collect(raw_dir: Path):
             continue
         ts = int(m.group("ts"))
         pod = m.group("pod")
-        if "gaie-epp" in pod:
+        if "gaie-epp" in pod or "router-epp" in pod:
             ed = parse_epp_log(f)
             if ed:
                 epp_series.append((ts, ed))
@@ -248,8 +248,15 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     has_rates = bool(epp_rates)
     wva_full = wva_metrics_per_variant(results_dir)
     has_wva_full = bool(wva_full)
+    # Skip the EPP-queue panel when it carries no real data (e.g. on v0.7.0
+    # the renamed router-epp isn't scraped by the gaie-keyed collector), so the
+    # plot doesn't show a null panel.
+    has_epp = bool(erows) and any(
+        (r.get("fc_queue") or r.get("pool_avg")
+         or r.get("per_pod_primary") or r.get("per_pod_v2")) for r in erows)
+    epp_shift = 0 if has_epp else 1
     n_extra = (1 if has_supply_demand else 0) + (1 if has_rates else 0) + (2 if has_wva_full else 0)
-    n_panels = 5 + n_extra
+    n_panels = (5 if has_epp else 4) + n_extra
     fig, axes = plt.subplots(
         n_panels, 1,
         figsize=(8, 11 + 2 * n_extra),
@@ -370,23 +377,22 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.3)
 
-    # 5. EPP Queue
-    ax = axes[4 + base]
-    ax.set_title("EPP Queue Metrics (single y-axis, all in same units)")
-    if erows:
+    # 5. EPP Queue (skipped entirely when it has no real data)
+    if has_epp:
+        ax = axes[4 + base]
+        ax.set_title("EPP Queue Metrics (single y-axis, all in same units)")
         x = [to_dt(r["ts"]) for r in erows]
         ax.plot(x, [r["fc_queue"] for r in erows], color="black", label="flow_control_queue (gateway)")
         ax.plot(x, [r["pool_avg"] for r in erows], color="orange", label="pool_average_queue", alpha=0.8)
         ax.plot(x, [r["per_pod_primary"] for r in erows], color=PRIMARY_COLOR, linestyle="--", label="per pod sum: primary")
         ax.plot(x, [r["per_pod_v2"] for r in erows], color=V2_COLOR, linestyle="--", label="per pod sum: v2")
-    ax.set_ylabel("Requests in queue")
-    ax.set_xlabel("Time (UTC)")
-    ax.legend(loc="upper left", fontsize=7)
-    ax.grid(alpha=0.3)
+        ax.set_ylabel("Requests in queue")
+        ax.legend(loc="upper left", fontsize=7)
+        ax.grid(alpha=0.3)
 
     # 6. (Optional) Request rate from EPP counters
     if has_rates:
-        ax = axes[5 + base]
+        ax = axes[5 + base - epp_shift]
         ax.set_title("Gateway throughput  (EPP counters → finite-difference rate)")
         x = [to_dt(s["timestamp"]) for s in epp_rates]
         rps = [s.get("rates", {}).get("request_total_per_s", 0.0) for s in epp_rates]
@@ -407,7 +413,7 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
         # internal "how loaded is each variant" reading; differs from the
         # KV-only panel because it folds in queue contributions and uses the
         # capacity-weighted formula).
-        ax = axes[5 + base + (1 if has_rates else 0)]
+        ax = axes[5 + base + (1 if has_rates else 0) - epp_shift]
         ax.set_title(
             "WVA Saturation Utilization  (per variant, analyzer-internal)")
         sat_pri = [s.get("primary", {}).get("wva_saturation_utilization") for s in wva_full]
@@ -428,7 +434,7 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
 
         # Panel 8: per-variant tokens used vs capacity (analyzer view).
         # Solid = wva_kv_cache_tokens_used, dashed = wva_kv_cache_tokens_capacity.
-        ax = axes[6 + base + (1 if has_rates else 0)]
+        ax = axes[6 + base + (1 if has_rates else 0) - epp_shift]
         ax.set_title("WVA KV Tokens In Use vs Capacity  (per variant)")
         used_pri = [s.get("primary", {}).get("wva_kv_cache_tokens_used") for s in wva_full]
         cap_pri  = [s.get("primary", {}).get("wva_kv_cache_tokens_capacity") for s in wva_full]
@@ -445,6 +451,17 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
         ax.grid(alpha=0.3)
         ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
+    # Bound the x-axis to the active window (load + scale-down), clipping the
+    # dead/zero tail after collection so the load isn't squished into the left.
+    act = [r["timestamp"] for r in cd_est] if cd_est else []
+    if repls:
+        act += [t[0] for t in repls if (t[1] or 0) > 1 or (t[2] or 0) > 1]
+    if act:
+        lo, hi = min(act), max(act)
+        span = max(hi - lo, 60)
+        axes[-1].set_xlim(to_dt(lo - span * 0.03), to_dt(hi + span * 0.05))
+
+    axes[-1].set_xlabel("Time (UTC)")
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=timezone.utc))
 
     final_prim = repls[-1][1] if repls else 0
