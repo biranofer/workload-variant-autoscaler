@@ -280,6 +280,21 @@ metrics, logs, and processed timeseries.
 When `BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX=v2` is set, `benchmark-run`
 automatically produces two outputs after the run completes:
 
+**Run `post_run_analyze.sh` promptly** (within a few minutes of run completion —
+the WVA controller pod's log buffer rotates and the window for extracting
+controller decisions closes):
+
+```bash
+bash hack/benchmark/post_run_analyze.sh <results-dir> $NS
+# e.g. bash hack/benchmark/post_run_analyze.sh \
+#   biran-20260704-135514-081/results/guidellm-1783162554-04wm0f_1 biran
+```
+
+This runs five steps: dumps WVA controller decisions + V2 saturation analysis
+numbers from pod logs, computes capacity/demand estimates from raw vLLM/EPP
+scrapes, extracts EPP throughput and WVA Prometheus timeseries, and renders the
+full-pipeline PNG plot into `<results-dir>/metrics/graphs/`.
+
 **Markdown table** (printed to stdout, copy-paste into `docs/benchmark.md`):
 
 ```
@@ -381,10 +396,15 @@ controller image are both at `v0.8.0-rc5` or newer
 | `hack/benchmark/scenarios/guides/two-variant-wva.yaml` | Scenario / values for primary stack (cost 10, min/max 1/10, TP=2, HPA 100% per 15 s, vllmService enabled). Copied into the `llm-d-benchmark` checkout automatically by `make benchmark-standup`. |
 | `hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml` | Default secondary-variant config (suffix `v2`, cost 5.0, TP=1) consumed by `make benchmark-add-variant`. Override path with `VARIANT_CONFIG=<path>`. |
 | `hack/benchmark/add_variant.py` | Creates secondary `Deployment`/`VA`/`HPA` from primary, with the kebab-label trick. |
+| `hack/benchmark/post_run_analyze.sh` | Wraps the five post-run dump+plot steps. Must run promptly after `benchmark-run` — the WVA controller log buffer rotates. Usage: `bash hack/benchmark/post_run_analyze.sh <results-dir> [namespace]`. |
+| `hack/benchmark/dump_wva_target_timeseries.py` | Extracts WVA controller decisions and V2 saturation analysis numbers (supply, demand, utilization, required/spare capacity) from pod logs into `metrics/processed/wva_target_timeseries.json`. |
+| `hack/benchmark/dump_capacity_demand_estimate.py` | Computes per-variant capacity/demand estimate from raw vLLM/EPP scrapes into `metrics/processed/capacity_demand_estimate.json`. |
+| `hack/benchmark/dump_epp_throughput.py` | Derives request rate from EPP counters into `metrics/processed/epp_throughput.json`. |
+| `hack/benchmark/dump_wva_full_timeseries.py` | Extracts WVA Prometheus metrics timeseries into `metrics/processed/wva_metrics_timeseries.json`. |
 | `hack/benchmark/postprocess.py` | Generates a markdown results table (matching `docs/benchmark.md`) from a results directory. Called automatically by `make benchmark-report`. Pass `--secondary-suffix v2` for per-variant replica rows and weighted cost. |
-| `hack/benchmark/plot_two_variant_pipeline.py` | Generates the full-pipeline PNG (up to 7 panels: replicas, capacity/demand, KV cache, requests running/waiting, EPP queue, gateway throughput). Called automatically by `make benchmark-plot-two-variant`. |
+| `hack/benchmark/plot_two_variant_pipeline.py` | Generates the full-pipeline PNG (up to 7 panels: replicas, capacity/demand, KV cache, requests running/waiting, EPP queue, gateway throughput, WVA saturation utilization). Called automatically by `make benchmark-plot-two-variant`. |
 | `hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml` | ConfigMap setting `analyzerName: saturation` to select V2. Applied by `make benchmark-enable-v2-saturation`. |
-| `test/benchmark/scenarios/prefill_heavy.yaml.in` | Default workload for `make benchmark-run`. |
+| `test/benchmark/scenarios/prefill_heavy.yaml.in` | Default workload for `make benchmark-run`. Edit `rate`/`max_seconds` here — `make benchmark-run` copies this file at run-time, overriding any stale defaults in the benchmark repo. |
 
 ---
 
