@@ -33,7 +33,6 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
 from statistics import mean
 
 METRICS = [
@@ -152,26 +151,38 @@ def _extract_latency(results_dir):
     return None, None, None, None
 
 
-def _extract_run_duration_min(results_dir):
-    """Run duration in minutes from run_metadata.yaml."""
-    path = os.path.join(results_dir, "run_metadata.yaml")
+def _extract_gpu_time_min(results_dir, gpus_per_replica, workload_duration_min=None):
+    """GPU time in GPU·min = avg_replicas × gpus × workload_duration_min.
+
+    workload_duration_min: explicit workload duration (use the scenario duration,
+    e.g. 15 min for the prefill_rampup scenario).  When provided, all runs use the
+    same denominator so the comparison is fair even if harness setup/teardown timing
+    differs between runs.  When None, falls back to the WVA timeseries time span
+    (less reliable for cross-run comparisons).
+
+    Replica counts come from wva_target_timeseries.json primary field.
+    """
+    path = os.path.join(results_dir, "metrics", "processed",
+                        "wva_target_timeseries.json")
     if not os.path.isfile(path):
         return None
-    start = stop = None
     with open(path) as f:
-        for line in f:
-            if line.startswith("harness_start:"):
-                start = line.split(":", 1)[1].strip().strip('"')
-            elif line.startswith("harness_stop:"):
-                stop = line.split(":", 1)[1].strip().strip('"')
-    if not start or not stop:
+        data = json.load(f)
+    samples = [s for s in data.get("samples", []) if s.get("primary") is not None]
+    if not samples:
         return None
-    try:
-        t0 = datetime.fromisoformat(start)
-        t1 = datetime.fromisoformat(stop)
-        return (t1 - t0).total_seconds() / 60.0
-    except ValueError:
+
+    vals = [s["primary"] for s in samples]
+    avg = sum(vals) / len(vals)
+
+    if workload_duration_min is not None:
+        duration = workload_duration_min
+    elif len(samples) >= 2:
+        duration = (samples[-1]["timestamp"] - samples[0]["timestamp"]) / 60.0
+    else:
         return None
+
+    return avg * gpus_per_replica * duration
 
 
 def _extract_error_count(results_dir):
@@ -348,7 +359,8 @@ def _fmt(metric, value):
 
 def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
                 gpus_per_secondary=1, gpus_per_replica=None,
-                primary_label="primary", secondary_label="secondary"):
+                primary_label="primary", secondary_label="secondary",
+                workload_duration_min=None):
     """Extract all benchmark.md metrics from one results directory.
 
     When secondary_suffix is given, replica stats are split per variant and a
@@ -387,10 +399,7 @@ def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
 
     avg_rep, max_rep = _extract_replica_stats(results_dir)
     gpus = gpus_per_replica if gpus_per_replica is not None else gpus_per_primary
-    duration_min = _extract_run_duration_min(results_dir)
-    gpu_time = None
-    if avg_rep is not None and duration_min is not None:
-        gpu_time = avg_rep * gpus * duration_min
+    gpu_time = _extract_gpu_time_min(results_dir, gpus, workload_duration_min)
     return {
         "Avg TTFT (ms)": avg_ttft,
         "P99 TTFT (ms)": p99_ttft,
@@ -461,6 +470,9 @@ def main():
                     help="Path to the secondary variant config YAML; tensor: value sets gpus-per-secondary")
     ap.add_argument("--gpus-per-replica", type=int, default=None,
                     help="GPU count per replica for single-variant GPU time calculation")
+    ap.add_argument("--workload-duration-min", type=float, default=None,
+                    help="Fixed workload duration in minutes for GPU time (use scenario "
+                         "duration, e.g. 15 for prefill_rampup; ensures fair cross-run comparison)")
     ap.add_argument("--labels", nargs="+", default=None,
                     help="Custom column labels for each results directory (e.g. 'V1 Analyzer' 'V2 Analyzer')")
     args = ap.parse_args()
@@ -489,6 +501,7 @@ def main():
             gpus_per_replica=args.gpus_per_replica,
             primary_label=args.primary_label,
             secondary_label=args.secondary_label,
+            workload_duration_min=args.workload_duration_min,
         ))
         if args.labels and i < len(args.labels):
             labels.append(args.labels[i])

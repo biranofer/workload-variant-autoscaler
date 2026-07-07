@@ -47,21 +47,37 @@ def _parse_iso(ts_str):
 
 
 def load_replica_timeseries(results_dir: Path):
-    """Return list of (unix_ts, ready_replicas) for decode controllers."""
+    """Return list of (unix_ts, replicas).
+
+    Primary source: replica_status_timeseries.json (decode controllers, ready replicas).
+    Fallback: wva_target_timeseries.json primary field (WVA desired replicas) when
+    the Kubernetes scraper returns empty controllers (inference-perf runs).
+    """
     p = results_dir / "metrics" / "processed" / "replica_status_timeseries.json"
-    if not p.is_file():
-        return []
-    data = json.loads(p.read_text())
-    out = []
-    for snap in data["snapshots"]:
-        ts = int(_parse_iso(snap["timestamp"]).timestamp())
-        total = sum(
-            (c.get("ready_replicas") or 0)
-            for c in snap["controllers"]
-            if "decode" in c.get("name", "")
-        )
-        out.append((ts, total))
-    return out
+    if p.is_file():
+        data = json.loads(p.read_text())
+        out = []
+        for snap in data["snapshots"]:
+            ts = int(_parse_iso(snap["timestamp"]).timestamp())
+            total = sum(
+                (c.get("ready_replicas") or 0)
+                for c in snap["controllers"]
+                if "decode" in c.get("name", "")
+            )
+            out.append((ts, total))
+        if any(r > 0 for _, r in out):
+            return out
+
+    # Fallback: WVA desired replica decisions
+    wva = results_dir / "metrics" / "processed" / "wva_target_timeseries.json"
+    if wva.is_file():
+        samples = json.loads(wva.read_text()).get("samples", [])
+        return [
+            (s["timestamp"], s["primary"])
+            for s in samples
+            if s.get("primary") is not None
+        ]
+    return []
 
 
 def load_capacity_demand(results_dir: Path):
