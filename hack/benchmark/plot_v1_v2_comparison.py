@@ -242,14 +242,13 @@ def plot(v1_dir: Path, v2_dir: Path, out_path: Path, title: str):
     axes[2].text(5, axes[2].get_ylim()[1] * 0.95, f"{STAGE_RATES[0]} RPS",
                  fontsize=8, color="gray", va="top")
 
+    # Fix x-axis to the workload duration so both series share the same window.
+    # WVA log capture windows differ between runs (V1 often has a longer post-workload
+    # tail), which would cause one series to end visually earlier than the other.
+    workload_end = STAGE_DURATION_S * len(STAGE_RATES)
     for ax in axes:
         ax.set_xlabel("Elapsed time (s)")
-        max_x = max(
-            (max((x for x, _ in v1_rep_norm), default=0),
-             max((x for x, _ in v2_rep_norm), default=0),
-             STAGE_DURATION_S * len(STAGE_RATES) + 60)
-        )
-        ax.set_xlim(0, max_x)
+        ax.set_xlim(0, workload_end + 30)
 
     fig.suptitle(title, fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
