@@ -425,7 +425,7 @@ def _compute_avg(runs, metrics):
 
 
 def format_table(runs, labels, metrics=None):
-    """Render a markdown table matching the benchmark.md style."""
+    """Render a column-aligned markdown table (renders cleanly in editors)."""
     if metrics is None:
         metrics = METRICS
     show_avg = len(runs) > 1
@@ -436,15 +436,28 @@ def format_table(runs, labels, metrics=None):
         cols.append("Avg")
         data_cols.append(_compute_avg(runs, metrics))
 
-    header = "| Metric | " + " | ".join(cols) + " |"
-    sep = "|--------|" + "|".join(["------"] * len(cols)) + "|"
+    # Pre-format all cells so we can measure widths
+    cell_grid = [[_fmt(m, run.get(m)) for run in data_cols] for m in metrics]
 
-    rows = []
-    for m in metrics:
-        cells = [_fmt(m, run.get(m)) for run in data_cols]
-        rows.append(f"| {m} | " + " | ".join(cells) + " |")
+    # Column widths: max of header, separator min (6), and all cell values
+    metric_w = max(len("Metric"), max(len(m) for m in metrics))
+    col_ws = [
+        max(6, len(col), max((len(cell_grid[r][c]) for r in range(len(metrics))), default=0))
+        for c, col in enumerate(cols)
+    ]
 
-    return "\n".join([header, sep] + rows)
+    def _row(left, cells, widths):
+        padded = [c.ljust(w) for c, w in zip(cells, widths)]
+        return "| " + left + " | " + " | ".join(padded) + " |"
+
+    header = _row("Metric".ljust(metric_w), [c.ljust(w) for c, w in zip(cols, col_ws)], col_ws)
+    sep = "| " + "-" * metric_w + " | " + " | ".join("-" * w for w in col_ws) + " |"
+
+    rows = [header, sep]
+    for m, cells in zip(metrics, cell_grid):
+        rows.append(_row(m.ljust(metric_w), cells, col_ws))
+
+    return "\n".join(rows)
 
 
 def main():
