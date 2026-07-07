@@ -428,7 +428,7 @@ def format_table(runs, labels, metrics=None):
     """Render a column-aligned markdown table (renders cleanly in editors)."""
     if metrics is None:
         metrics = METRICS
-    show_avg = len(runs) > 1
+    show_avg = len(runs) > 2
     cols = list(labels)
     data_cols = list(runs)
 
