@@ -4,8 +4,8 @@ name: "Prefill Heavy"
 description: "Stress-tests prefill (prompt processing) with long input, short output"
 request_type: text_completions
 profile: poisson
-rate: 20
-max_seconds: 600
+rate: 15
+max_seconds: 900
 data:
   prompt_tokens: 4000
   output_tokens: 1000
