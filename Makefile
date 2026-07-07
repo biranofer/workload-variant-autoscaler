@@ -410,7 +410,7 @@ benchmark-run: ## Run a single benchmark workload (set BENCHMARK_NAMESPACE=<name
 	@echo "  Generating benchmark report..."
 	@echo "========================================="
 	@$(MAKE) benchmark-report
-	@$(MAKE) benchmark-plot-two-variant || true
+	@if [ -n "$(BENCHMARK_TWO_VARIANT_SECONDARY_SUFFIX)" ]; then $(MAKE) benchmark-plot-two-variant || true; fi
 
 .PHONY: benchmark-report
 benchmark-report: ## Generate a markdown table from the latest benchmark results
