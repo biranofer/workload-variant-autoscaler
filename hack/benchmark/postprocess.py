@@ -21,6 +21,11 @@ Usage:
     python hack/benchmark/postprocess.py --secondary-suffix v2 \\
         --gpus-per-primary 2 --gpus-per-secondary 1 \\
         results/guidellm-*_1
+
+    # V1 vs V2 analyzer comparison (single-variant, with GPU time):
+    python hack/benchmark/postprocess.py --labels "V1 Analyzer" "V2 Analyzer" \\
+        --gpus-per-replica 2 \\
+        results/inference-perf-*_v1 results/inference-perf-*_v2
 """
 
 import argparse
@@ -28,13 +33,17 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from statistics import mean
 
 METRICS = [
+    "Avg TTFT (ms)",
     "P99 TTFT (ms)",
+    "Avg TPOT (ms/token)",
     "P99 ITL (ms/token)",
     "Avg replicas",
     "Max replicas",
+    "GPU time (GPU·min)",
     "Avg KV cache utilization",
     "Avg queue depth (EPP)",
     "Error count",
@@ -45,7 +54,9 @@ METRICS = [
 # and a weighted-cost row replaces the plain replica rows.
 def _variant_metrics(primary_label, secondary_label):
     return [
+        "Avg TTFT (ms)",
         "P99 TTFT (ms)",
+        "Avg TPOT (ms/token)",
         "P99 ITL (ms/token)",
         f"Avg {primary_label} replicas",
         f"Max {primary_label} replicas",
@@ -90,10 +101,13 @@ def _parse_prometheus_value(line, metric_name):
 
 
 def _extract_latency(results_dir):
-    """P99 TTFT and P99 ITL from results.json."""
+    """Avg and P99 TTFT; avg and P99 ITL from results.json.
+
+    Returns (avg_ttft, p99_ttft, avg_tpot, p99_itl).
+    """
     path = os.path.join(results_dir, "results.json")
     if not os.path.isfile(path):
-        return None, None
+        return None, None, None, None
 
     with open(path) as f:
         data = json.load(f)
@@ -107,7 +121,37 @@ def _extract_latency(results_dir):
             pcts = {p["percentile"]: p["value"] for p in pcts}
         return pcts.get("p99") or pcts.get(99) or section.get("max")
 
-    return _p99("time_to_first_token_ms"), _p99("inter_token_latency_ms")
+    def _mean(section_key):
+        return metrics.get(section_key, {}).get("successful", {}).get("mean")
+
+    avg_ttft = _mean("time_to_first_token_ms")
+    p99_ttft = _p99("time_to_first_token_ms")
+    # TPOT: prefer time_per_output_token_ms (inference-perf); fall back to inter_token_latency_ms (guidellm)
+    avg_tpot = _mean("time_per_output_token_ms") or _mean("inter_token_latency_ms")
+    p99_itl = _p99("inter_token_latency_ms")
+    return avg_ttft, p99_ttft, avg_tpot, p99_itl
+
+
+def _extract_run_duration_min(results_dir):
+    """Run duration in minutes from run_metadata.yaml."""
+    path = os.path.join(results_dir, "run_metadata.yaml")
+    if not os.path.isfile(path):
+        return None
+    start = stop = None
+    with open(path) as f:
+        for line in f:
+            if line.startswith("harness_start:"):
+                start = line.split(":", 1)[1].strip().strip('"')
+            elif line.startswith("harness_stop:"):
+                stop = line.split(":", 1)[1].strip().strip('"')
+    if not start or not stop:
+        return None
+    try:
+        t0 = datetime.fromisoformat(start)
+        t1 = datetime.fromisoformat(stop)
+        return (t1 - t0).total_seconds() / 60.0
+    except ValueError:
+        return None
 
 
 def _extract_error_count(results_dir):
@@ -246,14 +290,16 @@ def _fmt(metric, value):
     if value is None:
         return "?"
 
-    if metric == "P99 TTFT (ms)":
+    if metric in ("Avg TTFT (ms)", "P99 TTFT (ms)"):
         return f"{value:,.0f}"
-    if metric == "P99 ITL (ms/token)":
+    if metric in ("Avg TPOT (ms/token)", "P99 ITL (ms/token)"):
         return f"{value:.2f}" if (value * 100) % 10 != 0 else f"{value:.1f}"
     if metric in ("Avg replicas",) or metric.startswith("Avg ") and "replicas" in metric:
         return f"{value:.2f}"
     if metric in ("Max replicas",) or metric.startswith("Max ") and "replicas" in metric:
         return str(int(value))
+    if metric == "GPU time (GPU·min)":
+        return f"{value:.1f}"
     if metric == "Avg KV cache utilization":
         return f"{value:.1f}%"
     if metric == "Avg queue depth (EPP)":
@@ -268,14 +314,17 @@ def _fmt(metric, value):
 
 
 def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
-                gpus_per_secondary=1, primary_label="primary",
-                secondary_label="secondary"):
+                gpus_per_secondary=1, gpus_per_replica=None,
+                primary_label="primary", secondary_label="secondary"):
     """Extract all benchmark.md metrics from one results directory.
 
     When secondary_suffix is given, replica stats are split per variant and a
     weighted cost row is included.
+
+    gpus_per_replica: GPU count for single-variant GPU time calculation.
+    If None, falls back to gpus_per_primary.
     """
-    p99_ttft, p99_itl = _extract_latency(results_dir)
+    avg_ttft, p99_ttft, avg_tpot, p99_itl = _extract_latency(results_dir)
     kv_avg = _extract_kv_cache_avg(results_dir)
     queue_avg = _extract_queue_depth_avg(results_dir)
     startup_avg = _extract_pod_startup_avg(results_dir)
@@ -288,7 +337,9 @@ def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
         if p_avg is not None and s_avg is not None:
             cost = p_avg * gpus_per_primary + s_avg * gpus_per_secondary
         return {
+            "Avg TTFT (ms)": avg_ttft,
             "P99 TTFT (ms)": p99_ttft,
+            "Avg TPOT (ms/token)": avg_tpot,
             "P99 ITL (ms/token)": p99_itl,
             f"Avg {primary_label} replicas": p_avg,
             f"Max {primary_label} replicas": p_max,
@@ -302,11 +353,19 @@ def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
         }
 
     avg_rep, max_rep = _extract_replica_stats(results_dir)
+    gpus = gpus_per_replica if gpus_per_replica is not None else gpus_per_primary
+    duration_min = _extract_run_duration_min(results_dir)
+    gpu_time = None
+    if avg_rep is not None and duration_min is not None:
+        gpu_time = avg_rep * gpus * duration_min
     return {
+        "Avg TTFT (ms)": avg_ttft,
         "P99 TTFT (ms)": p99_ttft,
+        "Avg TPOT (ms/token)": avg_tpot,
         "P99 ITL (ms/token)": p99_itl,
         "Avg replicas": avg_rep,
         "Max replicas": max_rep,
+        "GPU time (GPU·min)": gpu_time,
         "Avg KV cache utilization": kv_avg,
         "Avg queue depth (EPP)": queue_avg,
         "Error count": error_count,
@@ -367,6 +426,10 @@ def main():
                     help="Path to the primary scenario YAML; tensor: value sets gpus-per-primary")
     ap.add_argument("--variant-config", type=str, default=None,
                     help="Path to the secondary variant config YAML; tensor: value sets gpus-per-secondary")
+    ap.add_argument("--gpus-per-replica", type=int, default=None,
+                    help="GPU count per replica for single-variant GPU time calculation")
+    ap.add_argument("--labels", nargs="+", default=None,
+                    help="Custom column labels for each results directory (e.g. 'V1 Analyzer' 'V2 Analyzer')")
     args = ap.parse_args()
 
     gpus_per_primary = _read_tensor_from_yaml(args.scenario_yaml)
@@ -380,7 +443,7 @@ def main():
 
     runs = []
     labels = []
-    for d in args.results_dirs:
+    for i, d in enumerate(args.results_dirs):
         if not os.path.isdir(d):
             print(f"WARNING: {d} is not a directory, skipping", file=sys.stderr)
             continue
@@ -390,10 +453,14 @@ def main():
             secondary_suffix=args.secondary_suffix,
             gpus_per_primary=gpus_per_primary,
             gpus_per_secondary=gpus_per_secondary,
+            gpus_per_replica=args.gpus_per_replica,
             primary_label=args.primary_label,
             secondary_label=args.secondary_label,
         ))
-        labels.append(f"Run {len(runs)}")
+        if args.labels and i < len(args.labels):
+            labels.append(args.labels[i])
+        else:
+            labels.append(f"Run {len(runs)}")
 
     if not runs:
         print("ERROR: No valid results directories found", file=sys.stderr)
