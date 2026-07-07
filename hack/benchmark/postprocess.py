@@ -101,35 +101,55 @@ def _parse_prometheus_value(line, metric_name):
 
 
 def _extract_latency(results_dir):
-    """Avg and P99 TTFT; avg and P99 ITL from results.json.
+    """Avg and P99 TTFT; avg and P99 ITL/TPOT.
 
-    Returns (avg_ttft, p99_ttft, avg_tpot, p99_itl).
+    Supports two harness result formats:
+      - GuideLLM: results.json with benchmarks[0].metrics.<key>_ms.successful.{mean,percentiles}
+      - inference-perf: summary_lifecycle_metrics.json with successes.latency.<key>.{mean,p99} (in seconds)
+
+    Returns (avg_ttft, p99_ttft, avg_tpot, p99_itl) all in milliseconds.
     """
+    # GuideLLM path
     path = os.path.join(results_dir, "results.json")
-    if not os.path.isfile(path):
-        return None, None, None, None
+    if os.path.isfile(path):
+        with open(path) as f:
+            data = json.load(f)
+        metrics = data["benchmarks"][0]["metrics"]
 
-    with open(path) as f:
-        data = json.load(f)
+        def _p99(section_key):
+            section = metrics.get(section_key, {}).get("successful", {})
+            pcts = section.get("percentiles", {})
+            if isinstance(pcts, list):
+                pcts = {p["percentile"]: p["value"] for p in pcts}
+            return pcts.get("p99") or pcts.get(99) or section.get("max")
 
-    metrics = data["benchmarks"][0]["metrics"]
+        def _mean(section_key):
+            return metrics.get(section_key, {}).get("successful", {}).get("mean")
 
-    def _p99(section_key):
-        section = metrics.get(section_key, {}).get("successful", {})
-        pcts = section.get("percentiles", {})
-        if isinstance(pcts, list):
-            pcts = {p["percentile"]: p["value"] for p in pcts}
-        return pcts.get("p99") or pcts.get(99) or section.get("max")
+        avg_ttft = _mean("time_to_first_token_ms")
+        p99_ttft = _p99("time_to_first_token_ms")
+        avg_tpot = _mean("time_per_output_token_ms") or _mean("inter_token_latency_ms")
+        p99_itl = _p99("inter_token_latency_ms")
+        return avg_ttft, p99_ttft, avg_tpot, p99_itl
 
-    def _mean(section_key):
-        return metrics.get(section_key, {}).get("successful", {}).get("mean")
+    # inference-perf path: summary_lifecycle_metrics.json (values in seconds)
+    path = os.path.join(results_dir, "summary_lifecycle_metrics.json")
+    if os.path.isfile(path):
+        with open(path) as f:
+            data = json.load(f)
+        lat = data.get("successes", {}).get("latency", {})
 
-    avg_ttft = _mean("time_to_first_token_ms")
-    p99_ttft = _p99("time_to_first_token_ms")
-    # TPOT: prefer time_per_output_token_ms (inference-perf); fall back to inter_token_latency_ms (guidellm)
-    avg_tpot = _mean("time_per_output_token_ms") or _mean("inter_token_latency_ms")
-    p99_itl = _p99("inter_token_latency_ms")
-    return avg_ttft, p99_ttft, avg_tpot, p99_itl
+        def _ms(section_key, stat):
+            v = lat.get(section_key, {}).get(stat)
+            return v * 1000.0 if v is not None else None
+
+        avg_ttft = _ms("time_to_first_token", "mean")
+        p99_ttft = _ms("time_to_first_token", "p99")
+        avg_tpot = _ms("time_per_output_token", "mean")
+        p99_itl = _ms("inter_token_latency", "p99")
+        return avg_ttft, p99_ttft, avg_tpot, p99_itl
+
+    return None, None, None, None
 
 
 def _extract_run_duration_min(results_dir):
@@ -165,26 +185,39 @@ def _extract_error_count(results_dir):
 
 
 def _extract_replica_stats(results_dir):
-    """Avg and max ready replicas from replica_status_timeseries.json."""
+    """Avg and max ready replicas.
+
+    Primary source: replica_status_timeseries.json (decode controllers).
+    Fallback: wva_target_timeseries.json primary field (WVA decisions), used
+    when the Kubernetes replica scraper returns empty controllers (inference-perf).
+    """
     path = os.path.join(results_dir, "metrics", "processed",
                         "replica_status_timeseries.json")
-    if not os.path.isfile(path):
-        return None, None
+    if os.path.isfile(path):
+        with open(path) as f:
+            data = json.load(f)
+        totals = []
+        for snap in data["snapshots"]:
+            ready = sum(
+                (c.get("ready_replicas", 0) or 0) for c in snap["controllers"]
+                if "decode" in c.get("name", "")
+            )
+            totals.append(ready)
+        if any(t > 0 for t in totals):
+            return mean(totals), max(totals)
 
-    with open(path) as f:
-        data = json.load(f)
+    # Fallback: WVA target decisions (primary field)
+    wva_path = os.path.join(results_dir, "metrics", "processed",
+                            "wva_target_timeseries.json")
+    if os.path.isfile(wva_path):
+        with open(wva_path) as f:
+            data = json.load(f)
+        vals = [s["primary"] for s in data.get("samples", [])
+                if s.get("primary") is not None]
+        if vals:
+            return mean(vals), max(vals)
 
-    totals = []
-    for snap in data["snapshots"]:
-        ready = sum(
-            (c.get("ready_replicas", 0) or 0) for c in snap["controllers"]
-            if "decode" in c.get("name", "")
-        )
-        totals.append(ready)
-
-    if not totals:
-        return None, None
-    return mean(totals), max(totals)
+    return None, None
 
 
 def _extract_variant_replica_stats(results_dir, secondary_suffix):
