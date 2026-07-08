@@ -35,7 +35,36 @@ V2_COLOR = "#d62728"
 
 # Expected duration of each rate stage in seconds.
 STAGE_DURATION_S = 300
-STAGE_RATES = [5, 10, 15]
+STAGE_RATES = [5, 10, 15]  # default; overridden by --rates CLI arg
+
+
+def _first_request_ts(results_dir: Path) -> float | None:
+    """Unix timestamp of the first actual inference request, detected from data.
+
+    Detection order:
+    1. epp_throughput.json — first sample with request_total_per_s > 0
+    2. capacity_demand_estimate.json — first sample with demandInUse > 0
+    Returns None if neither file is available or has non-zero signal.
+    """
+    epp_path = results_dir / "metrics" / "processed" / "epp_throughput.json"
+    if epp_path.is_file():
+        try:
+            for s in json.loads(epp_path.read_text()).get("samples", []):
+                if (s.get("rates", {}).get("request_total_per_s") or 0) > 0:
+                    return float(s["timestamp"])
+        except Exception:
+            pass
+
+    cd_path = results_dir / "metrics" / "processed" / "capacity_demand_estimate.json"
+    if cd_path.is_file():
+        try:
+            for s in json.loads(cd_path.read_text()).get("samples", []):
+                if (s.get("demandInUse") or 0) > 0:
+                    return float(s["timestamp"])
+        except Exception:
+            pass
+
+    return None
 
 FILE_RE = re.compile(r"^(?P<pod>.+?)_(?P<ts>\d{10})_metrics\.log$")
 KV_RE = re.compile(r"^vllm:kv_cache_usage_perc\{[^}]*\}\s+([0-9.eE+-]+)")
@@ -143,9 +172,13 @@ def load_raw_kv_waiting(results_dir: Path):
     return out
 
 
-def _normalize(series, t0):
-    """Shift timestamps so t0 = 0, return list of (elapsed_seconds, value)."""
-    return [(ts - t0, v) for ts, v in series]
+def _normalize(series, t0, offset=0.0):
+    """Shift timestamps so inference-start = 0.
+
+    t0      : unix timestamp of first sample in this series
+    offset  : pre-workload seconds (harness setup before inference starts)
+    """
+    return [(ts - t0 - offset, v) for ts, v in series]
 
 
 def _first_ts(repls, cd):
@@ -157,12 +190,15 @@ def _first_ts(repls, cd):
     return min(candidates) if candidates else None
 
 
-def _stage_boundaries(t0, n_stages=len(STAGE_RATES) - 1):
-    """X-positions (seconds from t0) for vertical stage-transition lines."""
-    return [STAGE_DURATION_S * (i + 1) for i in range(n_stages)]
+def _stage_boundaries(stage_rates):
+    """X-positions (seconds from inference-start) for vertical stage-transition lines."""
+    return [STAGE_DURATION_S * (i + 1) for i in range(len(stage_rates) - 1)]
 
 
-def plot(v1_dir: Path, v2_dir: Path, out_path: Path, title: str):
+def plot(v1_dir: Path, v2_dir: Path, out_path: Path, title: str, stage_rates=None):
+    if stage_rates is None:
+        stage_rates = STAGE_RATES
+
     # Load data
     v1_repls = load_replica_timeseries(v1_dir)
     v2_repls = load_replica_timeseries(v2_dir)
@@ -174,26 +210,34 @@ def plot(v1_dir: Path, v2_dir: Path, out_path: Path, title: str):
     v1_raw = load_raw_kv_waiting(v1_dir) if not v1_cd else []
     v2_raw = load_raw_kv_waiting(v2_dir) if not v2_cd else []
 
-    # Align time axes to seconds from run start
-    v1_t0 = _first_ts(v1_repls, v1_cd) or (v1_raw[0][0] if v1_raw else 0)
-    v2_t0 = _first_ts(v2_repls, v2_cd) or (v2_raw[0][0] if v2_raw else 0)
+    # Align both series so t=0 = first actual inference request.
+    # _first_request_ts detects this from EPP counters (most accurate);
+    # falls back to first-sample timestamp when unavailable.
+    def _t0_and_offset(results_dir, repls, cd, raw):
+        series_t0 = _first_ts(repls, cd) or (raw[0][0] if raw else 0)
+        req_ts = _first_request_ts(results_dir)
+        offset = (req_ts - series_t0) if req_ts is not None else 0.0
+        return series_t0, offset
 
-    v1_rep_norm = _normalize(v1_repls, v1_t0)
-    v2_rep_norm = _normalize(v2_repls, v2_t0)
+    v1_t0, v1_offset = _t0_and_offset(v1_dir, v1_repls, v1_cd, v1_raw)
+    v2_t0, v2_offset = _t0_and_offset(v2_dir, v2_repls, v2_cd, v2_raw)
 
-    def _cd_series(cd, raw, t0):
+    v1_rep_norm = _normalize(v1_repls, v1_t0, v1_offset)
+    v2_rep_norm = _normalize(v2_repls, v2_t0, v2_offset)
+
+    def _cd_series(cd, raw, t0, offset):
         if cd:
-            kv = [(s["timestamp"] - t0, s["kv_pct"]) for s in cd]
-            waiting = [(s["timestamp"] - t0, s["waiting_tokens"]) for s in cd]
+            kv = [(s["timestamp"] - t0 - offset, s["kv_pct"]) for s in cd]
+            waiting = [(s["timestamp"] - t0 - offset, s["waiting_tokens"]) for s in cd]
         else:
-            kv = [(ts - t0, kv_pct) for ts, kv_pct, _ in raw]
-            waiting = [(ts - t0, w) for ts, _, w in raw]
+            kv = [(ts - t0 - offset, kv_pct) for ts, kv_pct, _ in raw]
+            waiting = [(ts - t0 - offset, w) for ts, _, w in raw]
         return kv, waiting
 
-    v1_kv, v1_wait = _cd_series(v1_cd, v1_raw, v1_t0)
-    v2_kv, v2_wait = _cd_series(v2_cd, v2_raw, v2_t0)
+    v1_kv, v1_wait = _cd_series(v1_cd, v1_raw, v1_t0, v1_offset)
+    v2_kv, v2_wait = _cd_series(v2_cd, v2_raw, v2_t0, v2_offset)
 
-    boundaries = _stage_boundaries(0)
+    boundaries = _stage_boundaries(stage_rates)
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=False)
 
@@ -210,8 +254,7 @@ def plot(v1_dir: Path, v2_dir: Path, out_path: Path, title: str):
                     linewidth=2, label="V2 (saturation_v2)")
         for i, b in enumerate(boundaries):
             ax.axvline(b, color="gray", linestyle=":", linewidth=1.0, alpha=0.7)
-            rate = STAGE_RATES[i + 1]
-            ax.text(b + 5, ax.get_ylim()[1] * 0.95, f"{rate} RPS",
+            ax.text(b + 5, ax.get_ylim()[1] * 0.95, f"{stage_rates[i + 1]} RPS",
                     fontsize=8, color="gray", va="top")
         ax.set_ylabel(ylabel)
         ax.set_title(title_panel)
@@ -223,15 +266,14 @@ def plot(v1_dir: Path, v2_dir: Path, out_path: Path, title: str):
     # Panel 1: Replica count
     _draw_panel(axes[0], v1_rep_norm, v2_rep_norm,
                 "Replicas", "Ready Replicas Over Time")
-    # Annotate first stage rate
-    axes[0].text(5, axes[0].get_ylim()[1] * 0.95, f"{STAGE_RATES[0]} RPS",
+    axes[0].text(5, axes[0].get_ylim()[1] * 0.95, f"{stage_rates[0]} RPS",
                  fontsize=8, color="gray", va="top")
 
     # Panel 2: KV cache utilization
     _draw_panel(axes[1], [(x, y) for x, y in v1_kv if y is not None],
                 [(x, y) for x, y in v2_kv if y is not None],
                 "KV Cache %", "KV Cache Utilization", ylim=(0, 100))
-    axes[1].text(5, 95, f"{STAGE_RATES[0]} RPS", fontsize=8, color="gray", va="top")
+    axes[1].text(5, 95, f"{stage_rates[0]} RPS", fontsize=8, color="gray", va="top")
 
     # Panel 3: Requests waiting
     _draw_panel(axes[2],
@@ -239,13 +281,11 @@ def plot(v1_dir: Path, v2_dir: Path, out_path: Path, title: str):
                 [(x, y) for x, y in v2_wait if y is not None],
                 "Waiting (tokens)" if v1_cd or v2_cd else "Waiting (requests)",
                 "Queue Depth (Requests Waiting)")
-    axes[2].text(5, axes[2].get_ylim()[1] * 0.95, f"{STAGE_RATES[0]} RPS",
+    axes[2].text(5, axes[2].get_ylim()[1] * 0.95, f"{stage_rates[0]} RPS",
                  fontsize=8, color="gray", va="top")
 
-    # Fix x-axis to the workload duration so both series share the same window.
-    # WVA log capture windows differ between runs (V1 often has a longer post-workload
-    # tail), which would cause one series to end visually earlier than the other.
-    workload_end = STAGE_DURATION_S * len(STAGE_RATES)
+    # Fix x-axis to workload duration (both series share same inference-aligned window)
+    workload_end = STAGE_DURATION_S * len(stage_rates)
     for ax in axes:
         ax.set_xlabel("Elapsed time (s)")
         ax.set_xlim(0, workload_end + 30)
@@ -268,7 +308,11 @@ def main():
                     help="Output filename (default: v1_v2_comparison.png)")
     ap.add_argument("--title", default="WVA Saturation Analyzer: V1 vs V2 — Prefill Ramp-Up (5→10→15 RPS)",
                     help="Plot title")
+    ap.add_argument("--rates", nargs="+", type=int, default=None,
+                    help="Rate stages in RPS, e.g. --rates 2 6 10 (default: 5 10 15)")
     args = ap.parse_args()
+
+    stage_rates = args.rates if args.rates else STAGE_RATES
 
     v1_dir = Path(args.v1).resolve()
     v2_dir = Path(args.v2).resolve()
@@ -278,7 +322,7 @@ def main():
     else:
         out_dir = v2_dir / "metrics" / "graphs"
 
-    plot(v1_dir, v2_dir, out_dir / args.name, args.title)
+    plot(v1_dir, v2_dir, out_dir / args.name, args.title, stage_rates=stage_rates)
 
 
 if __name__ == "__main__":

@@ -42,30 +42,40 @@ percentage threshold.
 ```bash
 NS=<your-namespace>
 
-# V1 run — default analyzer, no enable step needed
+# --- Before EVERY run: bounce decode pod + restart controller ---
+# Flushes residual KV cache and controller in-memory state so each run
+# starts with no history from the previous one.
+_clean_start() {
+    kubectl scale deploy -n $NS -l app.kubernetes.io/component=decode --replicas=0
+    kubectl wait --for=delete pod -n $NS -l app.kubernetes.io/component=decode --timeout=120s
+    kubectl scale deploy -n $NS -l app.kubernetes.io/component=decode --replicas=1
+    local decode_deploy=$(kubectl get deploy -n $NS -l app.kubernetes.io/component=decode -o name | head -1 | cut -d/ -f2)
+    kubectl rollout status -n $NS deploy/$decode_deploy --timeout=300s
+    make benchmark-restart-controller BENCHMARK_NAMESPACE=$NS
+    sleep 30  # one WVA reconcile to confirm KV=0%
+}
+
+# V1 run — ensure V1 analyzer is active (no analyzerName in configmap)
+_clean_start
 make benchmark-run BENCHMARK_NAMESPACE=$NS \
     BENCHMARK_HARNESS=inference-perf \
     BENCHMARK_WORKLOAD=prefill_rampup.yaml
 
 # Run post-analysis immediately (WVA log buffer rotates)
-./hack/benchmark/post_run_analyze.sh \
-    "$(ls -td ~/.llmdbenchmark/$USER-*/results/inference-perf-*_1 | head -1)" \
-    $NS
-V1_RESULTS="$(ls -td ~/.llmdbenchmark/$USER-*/results/inference-perf-*_1 | head -1)"
+V1_RESULTS="$(ls -td $PWD/$USER-*/results/inference-perf-*_1 2>/dev/null | head -1)"
+./hack/benchmark/post_run_analyze.sh "$V1_RESULTS" $NS
 
-# Switch to V2 — restart controller to flush scaling state
-make benchmark-restart-controller BENCHMARK_NAMESPACE=$NS
+# Switch to V2 and clean start
 make benchmark-enable-v2-saturation BENCHMARK_NAMESPACE=$NS
+_clean_start
 
 # V2 run
 make benchmark-run BENCHMARK_NAMESPACE=$NS \
     BENCHMARK_HARNESS=inference-perf \
     BENCHMARK_WORKLOAD=prefill_rampup.yaml
 
-./hack/benchmark/post_run_analyze.sh \
-    "$(ls -td ~/.llmdbenchmark/$USER-*/results/inference-perf-*_2 | head -1)" \
-    $NS
-V2_RESULTS="$(ls -td ~/.llmdbenchmark/$USER-*/results/inference-perf-*_2 | head -1)"
+V2_RESULTS="$(ls -td $PWD/$USER-*/results/inference-perf-*_2 2>/dev/null | head -1)"
+./hack/benchmark/post_run_analyze.sh "$V2_RESULTS" $NS
 ```
 
 > **Verify analyzer**: before each run, check controller logs with
@@ -93,6 +103,7 @@ Vertical dotted lines mark the 5→10 RPS and 10→15 RPS transitions.
 python3 hack/benchmark/postprocess.py \
     --labels "V1 Analyzer" "V2 Analyzer" \
     --gpus-per-replica 2 \
+    --workload-duration-min 15 \
     "$V1_RESULTS" "$V2_RESULTS"
 ```
 

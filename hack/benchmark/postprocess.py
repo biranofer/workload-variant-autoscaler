@@ -37,9 +37,13 @@ from statistics import mean
 
 METRICS = [
     "Avg TTFT (ms)",
+    "P50 TTFT (ms)",
+    "P95 TTFT (ms)",
     "P99 TTFT (ms)",
     "Avg TPOT (ms/token)",
-    "P99 ITL (ms/token)",
+    "P50 TPOT (ms/token)",
+    "P95 TPOT (ms/token)",
+    "P99 TPOT (ms/token)",
     "Avg replicas",
     "Max replicas",
     "GPU time (GPU·min)",
@@ -54,9 +58,13 @@ METRICS = [
 def _variant_metrics(primary_label, secondary_label):
     return [
         "Avg TTFT (ms)",
+        "P50 TTFT (ms)",
+        "P95 TTFT (ms)",
         "P99 TTFT (ms)",
         "Avg TPOT (ms/token)",
-        "P99 ITL (ms/token)",
+        "P50 TPOT (ms/token)",
+        "P95 TPOT (ms/token)",
+        "P99 TPOT (ms/token)",
         f"Avg {primary_label} replicas",
         f"Max {primary_label} replicas",
         f"Avg {secondary_label} replicas",
@@ -100,13 +108,14 @@ def _parse_prometheus_value(line, metric_name):
 
 
 def _extract_latency(results_dir):
-    """Avg and P99 TTFT; avg and P99 ITL/TPOT.
+    """Avg/P50/P95/P99 TTFT and TPOT.
 
     Supports two harness result formats:
       - GuideLLM: results.json with benchmarks[0].metrics.<key>_ms.successful.{mean,percentiles}
-      - inference-perf: summary_lifecycle_metrics.json with successes.latency.<key>.{mean,p99} (in seconds)
+      - inference-perf: summary_lifecycle_metrics.json with successes.latency.<key>.{mean,p50,...} (in seconds)
 
-    Returns (avg_ttft, p99_ttft, avg_tpot, p99_itl) all in milliseconds.
+    Returns (avg_ttft, p50_ttft, p95_ttft, p99_ttft,
+             avg_tpot, p50_tpot, p95_tpot, p99_tpot) all in milliseconds.
     """
     # GuideLLM path
     path = os.path.join(results_dir, "results.json")
@@ -115,21 +124,27 @@ def _extract_latency(results_dir):
             data = json.load(f)
         metrics = data["benchmarks"][0]["metrics"]
 
-        def _p99(section_key):
+        def _pct(section_key, pct):
             section = metrics.get(section_key, {}).get("successful", {})
             pcts = section.get("percentiles", {})
             if isinstance(pcts, list):
                 pcts = {p["percentile"]: p["value"] for p in pcts}
-            return pcts.get("p99") or pcts.get(99) or section.get("max")
+            return pcts.get(pct) or pcts.get(str(pct))
 
         def _mean(section_key):
             return metrics.get(section_key, {}).get("successful", {}).get("mean")
 
-        avg_ttft = _mean("time_to_first_token_ms")
-        p99_ttft = _p99("time_to_first_token_ms")
-        avg_tpot = _mean("time_per_output_token_ms") or _mean("inter_token_latency_ms")
-        p99_itl = _p99("inter_token_latency_ms")
-        return avg_ttft, p99_ttft, avg_tpot, p99_itl
+        tpot_key = "time_per_output_token_ms" if "time_per_output_token_ms" in metrics else "inter_token_latency_ms"
+        return (
+            _mean("time_to_first_token_ms"),
+            _pct("time_to_first_token_ms", "p50") or _pct("time_to_first_token_ms", 50),
+            _pct("time_to_first_token_ms", "p95") or _pct("time_to_first_token_ms", 95),
+            _pct("time_to_first_token_ms", "p99") or _pct("time_to_first_token_ms", 99),
+            _mean(tpot_key),
+            _pct(tpot_key, "p50") or _pct(tpot_key, 50),
+            _pct(tpot_key, "p95") or _pct(tpot_key, 95),
+            _pct(tpot_key, "p99") or _pct(tpot_key, 99),
+        )
 
     # inference-perf path: summary_lifecycle_metrics.json (values in seconds)
     path = os.path.join(results_dir, "summary_lifecycle_metrics.json")
@@ -142,13 +157,18 @@ def _extract_latency(results_dir):
             v = lat.get(section_key, {}).get(stat)
             return v * 1000.0 if v is not None else None
 
-        avg_ttft = _ms("time_to_first_token", "mean")
-        p99_ttft = _ms("time_to_first_token", "p99")
-        avg_tpot = _ms("time_per_output_token", "mean")
-        p99_itl = _ms("inter_token_latency", "p99")
-        return avg_ttft, p99_ttft, avg_tpot, p99_itl
+        return (
+            _ms("time_to_first_token", "mean"),
+            _ms("time_to_first_token", "median"),
+            _ms("time_to_first_token", "p95"),
+            _ms("time_to_first_token", "p99"),
+            _ms("time_per_output_token", "mean"),
+            _ms("time_per_output_token", "median"),
+            _ms("time_per_output_token", "p95"),
+            _ms("time_per_output_token", "p99"),
+        )
 
-    return None, None, None, None
+    return (None,) * 8
 
 
 def _extract_gpu_time_min(results_dir, gpus_per_replica, workload_duration_min=None):
@@ -334,9 +354,10 @@ def _fmt(metric, value):
     if value is None:
         return "?"
 
-    if metric in ("Avg TTFT (ms)", "P99 TTFT (ms)"):
+    if metric in ("Avg TTFT (ms)", "P50 TTFT (ms)", "P95 TTFT (ms)", "P99 TTFT (ms)"):
         return f"{value:,.0f}"
-    if metric in ("Avg TPOT (ms/token)", "P99 ITL (ms/token)"):
+    if metric in ("Avg TPOT (ms/token)", "P50 TPOT (ms/token)",
+                  "P95 TPOT (ms/token)", "P99 TPOT (ms/token)"):
         return f"{value:.2f}" if (value * 100) % 10 != 0 else f"{value:.1f}"
     if metric in ("Avg replicas",) or metric.startswith("Avg ") and "replicas" in metric:
         return f"{value:.2f}"
@@ -369,7 +390,7 @@ def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
     gpus_per_replica: GPU count for single-variant GPU time calculation.
     If None, falls back to gpus_per_primary.
     """
-    avg_ttft, p99_ttft, avg_tpot, p99_itl = _extract_latency(results_dir)
+    avg_ttft, p50_ttft, p95_ttft, p99_ttft, avg_tpot, p50_tpot, p95_tpot, p99_tpot = _extract_latency(results_dir)
     kv_avg = _extract_kv_cache_avg(results_dir)
     queue_avg = _extract_queue_depth_avg(results_dir)
     startup_avg = _extract_pod_startup_avg(results_dir)
@@ -383,9 +404,13 @@ def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
             cost = p_avg * gpus_per_primary + s_avg * gpus_per_secondary
         return {
             "Avg TTFT (ms)": avg_ttft,
+            "P50 TTFT (ms)": p50_ttft,
+            "P95 TTFT (ms)": p95_ttft,
             "P99 TTFT (ms)": p99_ttft,
             "Avg TPOT (ms/token)": avg_tpot,
-            "P99 ITL (ms/token)": p99_itl,
+            "P50 TPOT (ms/token)": p50_tpot,
+            "P95 TPOT (ms/token)": p95_tpot,
+            "P99 TPOT (ms/token)": p99_tpot,
             f"Avg {primary_label} replicas": p_avg,
             f"Max {primary_label} replicas": p_max,
             f"Avg {secondary_label} replicas": s_avg,
@@ -402,9 +427,13 @@ def process_one(results_dir, secondary_suffix=None, gpus_per_primary=1,
     gpu_time = _extract_gpu_time_min(results_dir, gpus, workload_duration_min)
     return {
         "Avg TTFT (ms)": avg_ttft,
+        "P50 TTFT (ms)": p50_ttft,
+        "P95 TTFT (ms)": p95_ttft,
         "P99 TTFT (ms)": p99_ttft,
         "Avg TPOT (ms/token)": avg_tpot,
-        "P99 ITL (ms/token)": p99_itl,
+        "P50 TPOT (ms/token)": p50_tpot,
+        "P95 TPOT (ms/token)": p95_tpot,
+        "P99 TPOT (ms/token)": p99_tpot,
         "Avg replicas": avg_rep,
         "Max replicas": max_rep,
         "GPU time (GPU·min)": gpu_time,
