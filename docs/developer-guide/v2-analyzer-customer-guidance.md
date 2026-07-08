@@ -44,6 +44,7 @@ grows.
 | P99 TTFT | 274,086 ms | **81,185 ms** |
 | Avg TPOT | 29.67 ms/tok | **22.93 ms/tok** |
 | P50 TPOT | 31.77 ms/tok | **20.68 ms/tok** |
+| GPU time (15 min run) | 34.3 GPU·min | 73.8 GPU·min |
 
 Under a 3× rate step (2 → 6 RPS), the median time to first token dropped from
 **112 seconds to under one third of a second** — a 350× improvement. The average
@@ -80,10 +81,15 @@ depth provides a margin of safety that constant-rate sizing cannot.
 
 The token-demand analyzer provisions capacity proactively. During traffic
 surges, it will use more GPU·minutes than the standard analyzer for the same
-request volume — in the experiment above, 73.8 vs 34.3 GPU·min over the 15-
-minute run. If your traffic is consistently steady and predictable, the standard
-analyzer's conservative scaling may result in lower GPU spend with equivalent
-service quality.
+request volume. In the experiment above, the token-demand analyzer consumed
+**73.8 GPU·min** over the 15-minute run compared to **34.3 GPU·min** for the
+standard analyzer — a **2.15× increase in GPU time** in exchange for an **8.7×
+improvement in average TTFT** and a **350× improvement in median TTFT**. Whether
+that trade-off is favourable depends on the relative cost of GPU capacity versus
+the business impact of latency degradation during traffic surges.
+
+If your traffic is consistently steady and predictable, the standard analyzer's
+conservative scaling may result in lower GPU spend with equivalent service quality.
 
 Additionally, V2's tail TPOT (P95, P99) can be slightly higher during the
 scale-out phase when many new replicas are prefilling concurrently. In the
