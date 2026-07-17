@@ -546,8 +546,12 @@ def main():
         prometheus_url=args.prometheus_url,
     )
 
+    print(f"  Applying Deployment: {var_dep_name}")
+    kubectl_apply(var_dep, dry_run=args.dry_run)
+
     # Owner refs on ScaledObject point to the variant Deployment so that
     # deleting the Deployment also garbage-collects the ScaledObject.
+    # Must read the UID after applying the Deployment.
     if not args.dry_run:
         var_dep_uid = json.loads(kubectl(
             "get", "deployment", var_dep_name, "-n", ns, "-o", "json",
@@ -562,8 +566,6 @@ def main():
         }
         var_so.setdefault("metadata", {}).setdefault("ownerReferences", []).append(owner_ref)
 
-    print(f"  Applying Deployment: {var_dep_name}")
-    kubectl_apply(var_dep, dry_run=args.dry_run)
     print(f"  Applying ScaledObject: {var_so_name}")
     kubectl_apply(var_so, dry_run=args.dry_run)
 
