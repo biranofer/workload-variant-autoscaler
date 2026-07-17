@@ -8,6 +8,11 @@
 # WVA saturation solver can compare their costs under a unified queue-depth
 # signal and scale the more efficient variant first.
 #
+# Autoscaling uses KEDA ScaledObjects with the llm-d.ai/managed annotation.
+# WVA discovers both ScaledObjects and drives them via wva_desired_replicas.
+# `make benchmark-add-variant` creates ScaledObjects for both the primary
+# (on first run) and the added variant.
+#
 # Topology:
 #
 #         +--------- Gateway -------------------------+
@@ -18,8 +23,8 @@
 #               |                             |
 #     +---------+--------+       +------------+-----+
 #     | vLLM decode      |       | vLLM decode      |
-#     | primary (cost 10)|       | secondary (cost 5)|
-#     | VA + HPA         |       | VA + HPA          |
+#     | primary (cost 10)|       | variant  (cost 5)|
+#     | ScaledObject     |       | ScaledObject     |
 #     +------------------+       +------------------+
 #                   ^                       ^
 #                   +------- WVA (1) -------+
@@ -35,32 +40,29 @@
 # label on its pods: llm-d.ai/inference-serving: "true" (kebab-case), which
 # is the primary's own selector discriminator.
 #
-# The secondary Deployment created by `benchmark-add-variant` intentionally
+# The variant Deployment created by `benchmark-add-variant` intentionally
 # OMITS the kebab label but KEEPS the camelCase + model-hash labels, so:
 #   - The InferencePool picks up both Deployments' pods (two labels match).
-#   - The primary Deployment does not accidentally claim secondary pods
-#     (primary selector requires the kebab label, which secondary pods lack).
-#   - The secondary Deployment uses wva.llmd.ai/variant=v2 as a unique
+#   - The primary Deployment does not accidentally claim variant pods
+#     (primary selector requires the kebab label, which variant pods lack).
+#   - The variant Deployment uses wva.llmd.ai/variant=<suffix> as a unique
 #     discriminator in its own pod selector.
 #
-# Both VAs share spec.modelID = "unsloth/Meta-Llama-3.1-8B-Instruct" so the WVA
-# solver groups them and applies cost-weighted scaling.
+# Both ScaledObjects share llm-d.ai/model-id so the WVA solver groups them
+# and applies cost-weighted scaling.
 #
 # Running (two-step workflow):
 #
 #   # Step 1: stand up primary variant (cost 10.0)
 #   make benchmark-standup BENCHMARK_NAMESPACE=<ns> BENCHMARK_SPEC=guides/two-variant-wva
 #
-#   # Step 2: add secondary variant (cost 5.0, default)
+#   # Step 2: add variant (cost 5.0, default) — also creates primary ScaledObject on first run
 #   make benchmark-add-variant BENCHMARK_NAMESPACE=<ns>
-#
-#   # Optional: override cost or suffix
-#   make benchmark-add-variant BENCHMARK_NAMESPACE=<ns> VARIANT_COST=3.0 VARIANT_SUFFIX=v2
 #
 #   # Run the benchmark (both variants are in the same pool)
 #   make benchmark-run BENCHMARK_NAMESPACE=<ns>
 #
-#   # Teardown (removes all resources including secondary)
+#   # Teardown (removes all resources including added variant)
 #   make benchmark-teardown BENCHMARK_NAMESPACE=<ns>
 
 # ============================================================================
@@ -107,10 +109,9 @@ shared:
     vllmService:
       enabled: true
 
-  # Per PR #1145 requirement: tag every scrape target with its VariantAutoscaling
-  # name so the WVA collector can directly map metric rows to variants.
-  # The primary VA name = `<model_id_label>-decode`. add_variant.py overrides
-  # this on the secondary Deployment to point at the v2 VA.
+  # Tag every scrape target with its variant name so the WVA collector can
+  # directly map metric rows to variants. add_variant.py overrides this label
+  # on each added variant Deployment to its own deployment name.
   modelArtifacts:
     extraLabels:
       # NOTE: this is a model-derived value (the literal = <model_id_label>-decode
@@ -291,36 +292,14 @@ scenario:
       gpuMemoryUtilization: 0.85
 
     wva:
+      # Autoscaling objects (ScaledObjects) are created by `make benchmark-add-variant`
+      # via add_variant.py, not by the benchmark harness. This keeps both the primary
+      # and variant ScaledObjects consistent and avoids the deprecated
+      # VariantAutoscaling CRD path.
       variantAutoscaling:
-        enabled: true
-        minReplicas: 1
-        maxReplicas: 10
-        variantCost: "10.0"
-        slo:
-          tpot: 10
-          ttft: 1000
+        enabled: false
       hpa:
-        enabled: true
-        minReplicas: 1
-        maxReplicas: 10
-        targetAvgValue: 1
-        behavior:
-          scaleUp:
-            # Match the canonical WVA install samples (config/samples/hpa/...):
-            # scaleUp is immediate so the HPA follows WVA's optimizer decisions
-            # without damping; scaleDown stays windowed to avoid flapping on
-            # brief lulls (see config/samples/hpa/co-ordinator/base).
-            stabilizationWindowSeconds: 0
-            policies:
-              - type: Percent
-                value: 100
-                periodSeconds: 15
-          scaleDown:
-            stabilizationWindowSeconds: 120
-            policies:
-              - type: Percent
-                value: 100
-                periodSeconds: 15
+        enabled: false
 
     decode:
       replicas: 1

@@ -493,20 +493,25 @@ benchmark-plot-two-variant: ## Plot two-variant replica/latency/throughput graph
 	echo "Two-variant plot: $$LATEST_DIR/metrics/graphs/two_variant_v2_full_pipeline.png"
 
 VARIANT_CONFIG ?= $(CURDIR)/hack/benchmark/scenarios/guides/variants/v2-tp1-cheaper.yaml
+# Prometheus URL for KEDA ScaledObject triggers. Default is the OCP thanos-querier.
+# Override for vanilla Kubernetes clusters, e.g.:
+#   PROMETHEUS_URL=http://prometheus.monitoring.svc.cluster.local:9090
+PROMETHEUS_URL ?= https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
 WVA_V2_SATURATION_CONFIGMAP ?= $(CURDIR)/hack/benchmark/scenarios/wva_threshold/wva_saturation_v2_config.yaml
 WVA_CONTROLLER_DEPLOY ?= deploy/workload-variant-autoscaler-controller-manager
 WVA_ROLLOUT_TIMEOUT ?= 120s
 WVA_MONITORING_NAMESPACE ?= workload-variant-autoscaler-monitoring
 
 .PHONY: benchmark-add-variant
-benchmark-add-variant: ## Add a secondary WVA variant to the running benchmark (set BENCHMARK_NAMESPACE=<namespace>, optional VARIANT_CONFIG=<path>)
+benchmark-add-variant: ## Add a WVA variant to the running benchmark (set BENCHMARK_NAMESPACE=<namespace>, optional VARIANT_CONFIG=<path>, PROMETHEUS_URL=<url>)
 	@if [ -z "$(BENCHMARK_NAMESPACE)" ]; then \
 		echo "ERROR: BENCHMARK_NAMESPACE is required. Usage: make benchmark-add-variant BENCHMARK_NAMESPACE=<namespace>"; \
 		exit 1; \
 	fi
 	python3 $(CURDIR)/hack/benchmark/add_variant.py \
 		-n $(BENCHMARK_NAMESPACE) \
-		--config $(VARIANT_CONFIG)
+		--config $(VARIANT_CONFIG) \
+		--prometheus-url $(PROMETHEUS_URL)
 
 .PHONY: benchmark-enable-v2-saturation
 benchmark-enable-v2-saturation: ## Enable WVA saturation V2 analyzer (apply configmap + restart controller)

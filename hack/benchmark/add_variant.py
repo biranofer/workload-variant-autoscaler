@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-add_variant.py — Add a secondary WVA variant to an existing single-stack benchmark.
+add_variant.py — Add a WVA variant to an existing single-stack benchmark.
 
-Implements Topology B: one shared InferencePool/EPP fed by two Deployments,
-each with its own VariantAutoscaling (VA) at a different variantCost. The WVA
-saturation solver uses variantCost to decide which variant to scale first.
+Supports N variants. Run once per variant to add. Each variant gets its own
+KEDA ScaledObject with the llm-d.ai/managed annotation that WVA discovers.
+
+On the first run the script also creates a ScaledObject for the primary
+deployment (if one does not already exist), converting any legacy direct HPA
+that the benchmark harness may have created.
+
+Implements Topology B: one shared InferencePool/EPP fed by two or more
+Deployments, each with its own KEDA ScaledObject at a different
+llm-d.ai/variant-cost. The WVA cost-aware optimizer scales the most efficient
+variant (best capacity per unit cost) first and spills to the others.
 
 Label strategy
 --------------
@@ -15,22 +23,23 @@ The InferencePool created by the primary standup selects pods by:
 The primary Deployment selector additionally requires:
   llm-d.ai/inference-serving: "true"  (kebab-case)
 
-The secondary Deployment this script creates:
+The variant Deployment this script creates:
   - KEEPS  llm-d.ai/inferenceServing + llm-d.ai/model  → joins the pool
   - OMITS  llm-d.ai/inference-serving (kebab)           → not claimed by primary
   - ADDS   wva.llmd.ai/variant: <suffix>                → unique selector
 
-Both VAs share the same spec.modelID so the WVA solver groups them.
+All ScaledObjects share the same llm-d.ai/model-id annotation so the WVA
+solver groups them under one model and applies cost-weighted scaling.
 
 Usage
 -----
-  python hack/benchmark/add_variant.py -n NAMESPACE \
-      --config hack/benchmark/scenarios/guides/variants/<name>.yaml [--dry-run]
+  python hack/benchmark/add_variant.py -n NAMESPACE \\
+      --config hack/benchmark/scenarios/guides/variants/<name>.yaml \\
+      --prometheus-url https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
 
-The variant config yaml declares only what differs from the primary.
-Schema:
+The variant config yaml declares only what differs from the primary:
 
-  suffix: v2                     # required; secondary name suffix
+  suffix: v2                     # required; added variant name suffix
   variantCost: "5.0"             # default "5.0"
   minReplicas: 1                 # default 1
   maxReplicas: 10                # default 10
@@ -43,6 +52,7 @@ Schema:
 import argparse
 import copy
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +87,13 @@ def kubectl_apply(obj, dry_run=False):
     kubectl("apply", "-f", "-", stdin=payload)
 
 
+def kubectl_delete(kind, name, namespace, dry_run=False):
+    if dry_run:
+        print(f"[dry-run] kubectl delete {kind} {name} -n {namespace}")
+        return
+    kubectl("delete", kind, name, "-n", namespace, "--ignore-not-found=true")
+
+
 def _strip_managed(obj):
     """Remove server-managed fields before re-applying as a new object."""
     meta = obj.setdefault("metadata", {})
@@ -106,11 +123,7 @@ CONFIG_DEFAULTS = {
 
 
 def load_variant_config(path):
-    """Load a variant override yaml, validate, and apply defaults.
-
-    Required: `suffix`. All other keys are optional and inherit the primary's
-    value if omitted (with the defaults in CONFIG_DEFAULTS for VA fields).
-    """
+    """Load a variant override yaml, validate, and apply defaults."""
     p = Path(path)
     if not p.is_file():
         print(f"ERROR: variant config not found: {p}", file=sys.stderr)
@@ -141,8 +154,6 @@ def load_variant_config(path):
 # ---------------------------------------------------------------------------
 
 def find_primary_deployment(namespace):
-    # The llm-d.ai/* labels live on spec.selector.matchLabels (not metadata.labels),
-    # so kubectl -l filtering doesn't work — fetch all Deployments and filter here.
     out = kubectl("get", "deployment", "-n", namespace, "-o", "json")
     items = json.loads(out)["items"]
 
@@ -152,7 +163,6 @@ def find_primary_deployment(namespace):
             return False
         if sel.get("llm-d.ai/role") != "decode":
             return False
-        # Exclude secondary variants created by this script
         if "wva.llmd.ai/variant" in sel:
             return False
         return True
@@ -165,53 +175,71 @@ def find_primary_deployment(namespace):
         sys.exit(1)
     if len(primaries) > 1:
         names = [d["metadata"]["name"] for d in primaries]
-        print(f"ERROR: Multiple primary deployments found: {names}.",
-              file=sys.stderr)
+        print(f"ERROR: Multiple primary deployments found: {names}.", file=sys.stderr)
         sys.exit(1)
     return primaries[0]
 
 
-def find_primary_va(namespace, deployment_name):
-    out = kubectl("get", "variantautoscaling", "-n", namespace, "-o", "json")
-    vas = json.loads(out)["items"]
-    for va in vas:
-        if va["spec"]["scaleTargetRef"]["name"] == deployment_name:
-            return va
-    print(f"ERROR: No VariantAutoscaling found targeting deployment '{deployment_name}'",
-          file=sys.stderr)
-    sys.exit(1)
+def find_managed_scaledobject(namespace, deployment_name):
+    """Return the ScaledObject with llm-d.ai/managed=true targeting deployment_name, or None."""
+    out = kubectl("get", "scaledobject", "-n", namespace, "-o", "json",
+                  check=False)
+    try:
+        items = json.loads(out)["items"]
+    except (json.JSONDecodeError, KeyError):
+        return None
+    for so in items:
+        ann = so.get("metadata", {}).get("annotations", {})
+        if ann.get("llm-d.ai/managed") != "true":
+            continue
+        if so.get("spec", {}).get("scaleTargetRef", {}).get("name") == deployment_name:
+            return so
+    return None
 
 
-def find_primary_hpa(namespace, deployment_name):
+def find_managed_hpa(namespace, deployment_name):
+    """Return the direct HPA with llm-d.ai/managed=true targeting deployment_name, or None."""
     out = kubectl("get", "hpa", "-n", namespace, "-o", "json")
     hpas = json.loads(out)["items"]
     for hpa in hpas:
-        if hpa["spec"]["scaleTargetRef"]["name"] == deployment_name:
+        ann = hpa.get("metadata", {}).get("annotations", {})
+        if ann.get("llm-d.ai/managed") != "true":
+            continue
+        if hpa.get("spec", {}).get("scaleTargetRef", {}).get("name") == deployment_name:
             return hpa
-    print(f"ERROR: No HPA found targeting deployment '{deployment_name}'",
-          file=sys.stderr)
-    sys.exit(1)
+    return None
+
+
+def detect_model_id(primary_deployment):
+    """Extract the served model name from the primary deployment's vLLM args or env."""
+    containers = (primary_deployment.get("spec", {})
+                  .get("template", {}).get("spec", {})
+                  .get("containers", []))
+    for c in containers:
+        # Path 1: --model flag in args
+        args = c.get("args") or []
+        for i, a in enumerate(args):
+            if a == "--model" and i + 1 < len(args):
+                return args[i + 1]
+            if isinstance(a, str) and a.startswith("--model="):
+                return a.split("=", 1)[1]
+        # Path 2: VLLM_SERVED_MODEL_NAME or MODEL_NAME env var
+        for e in (c.get("env") or []):
+            if e.get("name") in ("VLLM_SERVED_MODEL_NAME", "MODEL_NAME", "LLMDBENCH_DEPLOY_CURRENT_MODEL"):
+                v = e.get("value", "")
+                if v:
+                    return v
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Container-arg overrides
+# Container-arg overrides (unchanged from original)
 # ---------------------------------------------------------------------------
 
 def _override_tensor_parallel(containers, tp_value):
-    """Set the effective tensor-parallel size on every container.
-
-    Two paths:
-      1. Direct exec form (`args: [..., "--tensor-parallel-size", "N", ...]`
-         or `--tensor-parallel-size=N`): rewrite the flag in-place.
-      2. sh -c form (the modelservice chart uses
-         `command: ["/bin/sh", "-c"]` with `$VLLM_TENSOR_PARALLELISM` inside
-         the shell string): override the `VLLM_TENSOR_PARALLELISM` env var
-         so the runtime expansion uses the secondary's value.
-    """
     flag = "--tensor-parallel-size"
     target = str(tp_value)
     for c in containers:
-        # Path 1: rewrite literal flag in args
         args = c.get("args")
         replaced_in_args = False
         if isinstance(args, list):
@@ -231,7 +259,6 @@ def _override_tensor_parallel(containers, tp_value):
                     new_args.append(a)
                     i += 1
             c["args"] = new_args
-        # Path 2: override the env var that sh -c expands at runtime.
         env = c.setdefault("env", [])
         replaced_in_env = False
         for e in env:
@@ -242,8 +269,6 @@ def _override_tensor_parallel(containers, tp_value):
                 break
         if not replaced_in_env:
             env.append({"name": "VLLM_TENSOR_PARALLELISM", "value": target})
-        # If neither path applied (no args, no shell), append the flag as
-        # a fallback so an out-of-tree exec form still picks it up.
         if not replaced_in_args and not replaced_in_env:
             if not isinstance(args, list):
                 args = []
@@ -252,19 +277,12 @@ def _override_tensor_parallel(containers, tp_value):
 
 
 def _override_gpu_resources(containers, gpu_count):
-    """Set both limits and requests of nvidia.com/gpu on every container that
-    already requests a GPU. Containers without a GPU resource are untouched
-    (init containers, sidecars).
-    """
     target = str(gpu_count)
     for c in containers:
         res = c.get("resources") or {}
         limits = res.get("limits") or {}
         requests = res.get("requests") or {}
-        already_has_gpu = (
-            "nvidia.com/gpu" in limits or "nvidia.com/gpu" in requests
-        )
-        if not already_has_gpu:
+        if "nvidia.com/gpu" not in limits and "nvidia.com/gpu" not in requests:
             continue
         limits["nvidia.com/gpu"] = target
         requests["nvidia.com/gpu"] = target
@@ -274,16 +292,6 @@ def _override_gpu_resources(containers, gpu_count):
 
 
 def _read_tensor_parallel(containers):
-    """Return the TP value seen in the first container that sets it, or None.
-
-    Two forms supported:
-      1. `--tensor-parallel-size N` (or `=N`) literal in args.
-      2. `--tensor-parallel-size $VLLM_TENSOR_PARALLELISM` (or just relying on
-         the env var) — resolved against the container's env. The modelservice
-         chart uses sh -c with this env-var reference, so without this lookup
-         _override_tensor_parallel and _read_tensor_parallel both miss the
-         actual TP value.
-    """
     flag = "--tensor-parallel-size"
     for c in containers:
         args = c.get("args") or []
@@ -303,16 +311,12 @@ def _read_tensor_parallel(containers):
                 if v.startswith("$"):
                     return env_tp
                 return v
-        # No literal flag in args. The modelservice chart wraps everything in
-        # `sh -c "<long shell string>"`, so the flag isn't tokenised in args
-        # at all — fall back to the env var.
         if env_tp is not None:
             return env_tp
     return None
 
 
 def _read_gpu_per_pod(containers):
-    """Return the GPU count from the first container with one, or None."""
     for c in containers:
         res = c.get("resources") or {}
         for bucket in ("limits", "requests"):
@@ -323,8 +327,6 @@ def _read_gpu_per_pod(containers):
 
 
 def _all_containers(deployment):
-    """All scrape-relevant containers in a Deployment template (main +
-    initContainers). Returns a list of dicts (mutable references)."""
     spec = deployment.get("spec", {}).get("template", {}).get("spec", {})
     return list(spec.get("containers") or []) + list(spec.get("initContainers") or [])
 
@@ -333,7 +335,7 @@ def _all_containers(deployment):
 # Object builders
 # ---------------------------------------------------------------------------
 
-def make_secondary_deployment(primary, cfg, namespace):
+def make_variant_deployment(primary, cfg, namespace):
     sec = copy.deepcopy(primary)
     _strip_managed(sec)
 
@@ -346,28 +348,16 @@ def make_secondary_deployment(primary, cfg, namespace):
     spec = sec["spec"]
     spec["replicas"] = 1
 
-    # --- pod template labels ------------------------------------------------
     tmpl_labels = spec["template"]["metadata"].setdefault("labels", {})
-    # Remove kebab label so primary Deployment selector won't claim these pods
     tmpl_labels.pop("llm-d.ai/inference-serving", None)
-    # Add variant discriminator
     tmpl_labels["wva.llmd.ai/variant"] = suffix
-    # Override the WVA variant label inherited from the primary pod template so
-    # this deployment's metrics map to the v2 VariantAutoscaling, not primary.
-    # Required by PR #1145 (Prometheus relabeling -> llm_d_ai_variant).
     tmpl_labels["llm-d.ai/variant"] = sec_name
 
-    # --- Deployment selector ------------------------------------------------
-    # Must match the pod template labels (minus kebab, plus variant).
-    # Kubernetes selector is immutable after creation so get it right once.
     sel = spec["selector"]["matchLabels"]
     sel.pop("llm-d.ai/inference-serving", None)
     sel["wva.llmd.ai/variant"] = suffix
-    # Override inherited primary's llm-d.ai/variant value so this selector
-    # matches the secondary's pod-template labels (PR #1145 alignment).
     sel["llm-d.ai/variant"] = sec_name
 
-    # --- shape overrides ----------------------------------------------------
     pod_spec = spec["template"]["spec"]
     main_containers = pod_spec.setdefault("containers", [])
 
@@ -382,49 +372,80 @@ def make_secondary_deployment(primary, cfg, namespace):
     return sec
 
 
-def make_secondary_va(primary_va, sec_dep_name, cfg, namespace):
-    primary_name = primary_va["metadata"]["name"]
-    sec = copy.deepcopy(primary_va)
-    _strip_managed(sec)
+def make_variant_scaledobject(dep_name, so_name, model_id, cost, min_replicas,
+                               max_replicas, namespace, prometheus_url):
+    """Build a KEDA ScaledObject for a WVA variant.
 
-    sec["metadata"]["name"] = f"{primary_name}-{cfg['suffix']}"
-    sec["metadata"]["namespace"] = namespace
-    # Inherit controller-instance label so the namespace-scoped controller sees it
-    sec["metadata"].setdefault("labels", {})
-    sec["metadata"]["labels"]["wva.llmd.ai/controller-instance"] = namespace
-
-    sec["spec"] = {
-        "scaleTargetRef": {
-            "kind": "Deployment",
-            "name": sec_dep_name,
+    WVA discovers the ScaledObject via the llm-d.ai/managed annotation and
+    emits wva_desired_replicas{variant_name=<so_name>, namespace=<namespace>}.
+    KEDA reads that metric and drives the HPA it manages.
+    """
+    return {
+        "apiVersion": "keda.sh/v1alpha1",
+        "kind": "ScaledObject",
+        "metadata": {
+            "name": so_name,
+            "namespace": namespace,
+            "annotations": {
+                "llm-d.ai/managed": "true",
+                "llm-d.ai/model-id": model_id,
+                "llm-d.ai/variant-cost": str(cost),
+            },
         },
-        "modelID": primary_va["spec"]["modelID"],
-        "variantCost": cfg["variantCost"],
-        "minReplicas": cfg["minReplicas"],
-        "maxReplicas": cfg["maxReplicas"],
+        "spec": {
+            "scaleTargetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": dep_name,
+            },
+            "pollingInterval": 15,
+            "cooldownPeriod": 300,
+            "minReplicaCount": min_replicas,
+            "maxReplicaCount": max_replicas,
+            "fallback": {
+                "failureThreshold": 3,
+                "replicas": 1,
+            },
+            "advanced": {
+                "restoreToOriginalReplicaCount": False,
+                "horizontalPodAutoscalerConfig": {
+                    "name": f"wva-keda-hpa-{dep_name}",
+                    "behavior": {
+                        "scaleUp": {
+                            "stabilizationWindowSeconds": 0,
+                            "policies": [
+                                {"type": "Percent", "value": 100, "periodSeconds": 15},
+                            ],
+                        },
+                        "scaleDown": {
+                            "stabilizationWindowSeconds": 120,
+                            "policies": [
+                                {"type": "Percent", "value": 100, "periodSeconds": 15},
+                            ],
+                        },
+                    },
+                },
+            },
+            "triggers": [
+                {
+                    "type": "prometheus",
+                    "name": "wva-desired-replicas",
+                    "metadata": {
+                        "serverAddress": prometheus_url,
+                        "query": (
+                            f'wva_desired_replicas{{'
+                            f'variant_name="{so_name}",'
+                            f'namespace="{namespace}"'
+                            f'}}'
+                        ),
+                        "threshold": "1",
+                        "activationThreshold": "0",
+                        "metricType": "Value",
+                    },
+                }
+            ],
+        },
     }
-    return sec
-
-
-def make_secondary_hpa(primary_hpa, sec_dep_name, cfg, namespace):
-    primary_name = primary_hpa["metadata"]["name"]
-    sec = copy.deepcopy(primary_hpa)
-    _strip_managed(sec)
-
-    sec["metadata"]["name"] = f"{primary_name}-{cfg['suffix']}"
-    sec["metadata"]["namespace"] = namespace
-
-    sec["spec"]["scaleTargetRef"]["name"] = sec_dep_name
-    sec["spec"]["minReplicas"] = cfg["minReplicas"]
-    sec["spec"]["maxReplicas"] = cfg["maxReplicas"]
-
-    for m in sec["spec"].get("metrics", []):
-        if m.get("type") == "External":
-            sel = m["external"]["metric"]["selector"]["matchLabels"]
-            if "variant_name" in sel:
-                sel["variant_name"] = sec_dep_name
-
-    return sec
 
 
 # ---------------------------------------------------------------------------
@@ -433,12 +454,15 @@ def make_secondary_hpa(primary_hpa, sec_dep_name, cfg, namespace):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Add a secondary WVA variant to an existing benchmark deployment."
+        description="Add a WVA variant to an existing benchmark deployment."
     )
     ap.add_argument("-n", "--namespace", required=True,
                     help="Kubernetes namespace")
     ap.add_argument("--config", required=True,
                     help="Path to a variant override yaml (see module docstring)")
+    ap.add_argument("--prometheus-url",
+                    default="https://thanos-querier.openshift-monitoring.svc.cluster.local:9091",
+                    help="Prometheus server URL for KEDA triggers (default: OCP thanos-querier)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print manifests as JSON without applying")
     args = ap.parse_args()
@@ -457,73 +481,112 @@ def main():
     primary_gpu = _read_gpu_per_pod(primary_containers) or "1"
     print(f"      {dep_name}  (llm-d.ai/model={model_hash})")
 
-    print(f"[2/3] Finding primary VariantAutoscaling...")
-    primary_va = find_primary_va(ns, dep_name)
-    model_id = primary_va["spec"]["modelID"]
-    primary_cost = primary_va["spec"].get("variantCost", "?")
-    print(f"      {primary_va['metadata']['name']}  "
-          f"(modelID={model_id}, variantCost={primary_cost})")
+    print(f"[2/3] Resolving primary ScaledObject...")
+    primary_so = find_managed_scaledobject(ns, dep_name)
+    primary_so_name = f"{dep_name}-scaler"
 
-    print(f"[3/3] Finding primary HPA...")
-    primary_hpa = find_primary_hpa(ns, dep_name)
-    print(f"      {primary_hpa['metadata']['name']}")
+    if primary_so is None:
+        # First run: check for legacy direct HPA left by the benchmark harness
+        legacy_hpa = find_managed_hpa(ns, dep_name)
+        if legacy_hpa is not None:
+            hpa_ann = legacy_hpa.get("metadata", {}).get("annotations", {})
+            model_id = hpa_ann.get("llm-d.ai/model-id") or detect_model_id(primary_dep)
+            primary_cost = hpa_ann.get("llm-d.ai/variant-cost", "10.0")
+            primary_min = legacy_hpa.get("spec", {}).get("minReplicas", 1)
+            primary_max = legacy_hpa.get("spec", {}).get("maxReplicas", 10)
+            print(f"      Found legacy direct HPA '{legacy_hpa['metadata']['name']}' "
+                  f"(model-id={model_id}, cost={primary_cost}) — converting to ScaledObject")
+        else:
+            model_id = detect_model_id(primary_dep) or dep_name
+            primary_cost = "10.0"
+            primary_min = 1
+            primary_max = 10
+            print(f"      No ScaledObject or HPA found — creating primary ScaledObject "
+                  f"(model-id={model_id}, cost={primary_cost})")
 
-    sec_dep_name = f"{dep_name}-{suffix}"
+        primary_so_obj = make_variant_scaledobject(
+            dep_name=dep_name,
+            so_name=primary_so_name,
+            model_id=model_id,
+            cost=primary_cost,
+            min_replicas=primary_min,
+            max_replicas=primary_max,
+            namespace=ns,
+            prometheus_url=args.prometheus_url,
+        )
+        print(f"  Applying primary ScaledObject: {primary_so_name}")
+        kubectl_apply(primary_so_obj, dry_run=args.dry_run)
 
-    print(f"\nCreating secondary variant '{suffix}'  "
-          f"variantCost={cfg['variantCost']}  modelID={model_id}\n")
+        if legacy_hpa is not None and not args.dry_run:
+            hpa_name = legacy_hpa["metadata"]["name"]
+            print(f"  Deleting legacy direct HPA: {hpa_name}")
+            kubectl_delete("hpa", hpa_name, ns, dry_run=args.dry_run)
+    else:
+        ann = primary_so.get("metadata", {}).get("annotations", {})
+        model_id = ann.get("llm-d.ai/model-id") or detect_model_id(primary_dep) or dep_name
+        primary_cost = ann.get("llm-d.ai/variant-cost", "10.0")
+        primary_so_name = primary_so["metadata"]["name"]
+        print(f"      {primary_so_name}  (model-id={model_id}, cost={primary_cost})")
 
-    sec_dep = make_secondary_deployment(primary_dep, cfg, ns)
-    sec_va = make_secondary_va(primary_va, sec_dep_name, cfg, ns)
-    sec_hpa = make_secondary_hpa(primary_hpa, sec_dep_name, cfg, ns)
+    print(f"[3/3] Creating variant '{suffix}'  "
+          f"variantCost={cfg['variantCost']}  modelID={model_id}")
 
-    print(f"  Applying Deployment: {sec_dep_name}")
-    kubectl_apply(sec_dep, dry_run=args.dry_run)
+    var_dep_name = f"{dep_name}-{suffix}"
+    var_so_name = f"{var_dep_name}-scaler"
 
-    # Owner refs on VA + HPA point to the secondary Deployment so
-    # `make benchmark-teardown` (which deletes the Deployment via the helm
-    # release's cascade) also garbage-collects the VA and HPA. Without this,
-    # the VA + HPA orphan in the namespace after teardown.
+    var_dep = make_variant_deployment(primary_dep, cfg, ns)
+    var_so = make_variant_scaledobject(
+        dep_name=var_dep_name,
+        so_name=var_so_name,
+        model_id=model_id,
+        cost=cfg["variantCost"],
+        min_replicas=cfg["minReplicas"],
+        max_replicas=cfg["maxReplicas"],
+        namespace=ns,
+        prometheus_url=args.prometheus_url,
+    )
+
+    # Owner refs on ScaledObject point to the variant Deployment so that
+    # deleting the Deployment also garbage-collects the ScaledObject.
     if not args.dry_run:
-        sec_dep_uid = json.loads(kubectl(
-            "get", "deployment", sec_dep_name, "-n", ns, "-o", "json",
+        var_dep_uid = json.loads(kubectl(
+            "get", "deployment", var_dep_name, "-n", ns, "-o", "json",
         ))["metadata"]["uid"]
         owner_ref = {
             "apiVersion": "apps/v1",
             "kind": "Deployment",
-            "name": sec_dep_name,
-            "uid": sec_dep_uid,
+            "name": var_dep_name,
+            "uid": var_dep_uid,
             "blockOwnerDeletion": True,
             "controller": False,
         }
-        sec_va.setdefault("metadata", {}).setdefault("ownerReferences", []).append(owner_ref)
-        sec_hpa.setdefault("metadata", {}).setdefault("ownerReferences", []).append(owner_ref)
+        var_so.setdefault("metadata", {}).setdefault("ownerReferences", []).append(owner_ref)
 
-    for kind, obj in [("VariantAutoscaling", sec_va), ("HPA", sec_hpa)]:
-        name = obj["metadata"]["name"]
-        print(f"  Applying {kind}: {name}")
-        kubectl_apply(obj, dry_run=args.dry_run)
+    print(f"  Applying Deployment: {var_dep_name}")
+    kubectl_apply(var_dep, dry_run=args.dry_run)
+    print(f"  Applying ScaledObject: {var_so_name}")
+    kubectl_apply(var_so, dry_run=args.dry_run)
 
     if args.dry_run:
         return
 
-    sec_containers = _all_containers(sec_dep)
-    sec_tp = _read_tensor_parallel(sec_containers) or "1"
-    sec_gpu = _read_gpu_per_pod(sec_containers) or "1"
+    var_containers = _all_containers(var_dep)
+    var_tp = _read_tensor_parallel(var_containers) or "1"
+    var_gpu = _read_gpu_per_pod(var_containers) or "1"
 
     print()
-    print("Secondary variant created successfully.")
-    print(f"  Primary   (cost {primary_cost:>5}, TP={primary_tp}, "
+    print("Variant added successfully.")
+    print(f"  Primary (cost {primary_cost:>5}, TP={primary_tp}, "
           f"{primary_gpu} GPU/pod): {dep_name}")
-    print(f"  Secondary (cost {cfg['variantCost']:>5}, TP={sec_tp}, "
-          f"{sec_gpu} GPU/pod): {sec_dep_name}")
+    print(f"  Added   (cost {cfg['variantCost']:>5}, TP={var_tp}, "
+          f"{var_gpu} GPU/pod): {var_dep_name}")
     print()
-    print("Both VAs share modelID=" + repr(model_id) + ".")
-    print("WVA will scale the more efficient variant first (most served load")
-    print("per unit cost), spilling over to the other only once it saturates.")
+    print("All ScaledObjects share model-id=" + repr(model_id) + ".")
+    print("WVA scales the most efficient variant first (highest capacity per")
+    print("unit cost), spilling to the others once it saturates.")
     print()
     print("Verify:")
-    print(f"  kubectl get va,hpa -n {ns}")
+    print(f"  kubectl get scaledobject,hpa -n {ns}")
     print(f"  kubectl get pods -n {ns} "
           f"-l 'llm-d.ai/inferenceServing=true,llm-d.ai/model={model_hash}'")
 
