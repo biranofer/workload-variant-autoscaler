@@ -386,6 +386,10 @@ def make_variant_scaledobject(dep_name, so_name, model_id, cost, min_replicas,
         "metadata": {
             "name": so_name,
             "namespace": namespace,
+            "labels": {
+                # Required for namespace-scoped WVA controller-instance filtering.
+                "wva.llmd.ai/controller-instance": namespace,
+            },
             "annotations": {
                 "llm-d.ai/managed": "true",
                 "llm-d.ai/model-id": model_id,
