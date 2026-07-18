@@ -519,7 +519,22 @@ benchmark-enable-v2-saturation: ## Enable WVA saturation V2 analyzer (apply conf
 		echo "ERROR: BENCHMARK_NAMESPACE is required. Usage: make benchmark-enable-v2-saturation BENCHMARK_NAMESPACE=<namespace>"; \
 		exit 1; \
 	fi
-	kubectl apply -n $(BENCHMARK_NAMESPACE) -f $(WVA_V2_SATURATION_CONFIGMAP)
+	@# Detect the saturation ConfigMap name: Kustomize installs use wva-saturation-scaling-config,
+	@# Helm-based installs use workload-variant-autoscaler-wva-saturation-scaling-config.
+	@# Prefer the shorter Kustomize name if both exist (the controller reads it).
+	@SAT_CM=$$(kubectl get configmap wva-saturation-scaling-config \
+		-n $(BENCHMARK_NAMESPACE) -o name 2>/dev/null | sed 's|configmap/||'); \
+	if [ -z "$$SAT_CM" ]; then \
+		SAT_CM=$$(kubectl get configmap -n $(BENCHMARK_NAMESPACE) \
+			-o name 2>/dev/null | grep "saturation-scaling-config" | head -1 | sed 's|configmap/||'); \
+	fi; \
+	if [ -z "$$SAT_CM" ]; then \
+		echo "ERROR: saturation-scaling-config ConfigMap not found in namespace $(BENCHMARK_NAMESPACE)"; \
+		exit 1; \
+	fi; \
+	echo "Patching ConfigMap $$SAT_CM to enable V2 saturation analyzer..."; \
+	kubectl patch configmap "$$SAT_CM" -n $(BENCHMARK_NAMESPACE) --type=merge \
+		-p '{"data":{"default":"analyzers:\n  - name: saturation\nkvCacheThreshold: 0.80\nqueueLengthThreshold: 5\nkvSpareTrigger: 0.1\nqueueSpareTrigger: 3\nenableLimiter: false\n"}}'
 	$(MAKE) benchmark-restart-controller BENCHMARK_NAMESPACE=$(BENCHMARK_NAMESPACE)
 
 .PHONY: benchmark-restart-controller
@@ -528,8 +543,15 @@ benchmark-restart-controller: ## Restart WVA controller to flush in-memory state
 		echo "ERROR: BENCHMARK_NAMESPACE is required. Usage: make benchmark-restart-controller BENCHMARK_NAMESPACE=<namespace>"; \
 		exit 1; \
 	fi
-	kubectl rollout restart -n $(BENCHMARK_NAMESPACE) $(WVA_CONTROLLER_DEPLOY)
-	kubectl rollout status -n $(BENCHMARK_NAMESPACE) $(WVA_CONTROLLER_DEPLOY) --timeout=$(WVA_ROLLOUT_TIMEOUT)
+	@# Detect the controller deployment name: Kustomize installs use wva-controller-manager,
+	@# Helm-based installs use workload-variant-autoscaler-controller-manager.
+	@DEPLOY=$$(kubectl get deploy -n $(BENCHMARK_NAMESPACE) \
+		-l app.kubernetes.io/name=workload-variant-autoscaler \
+		-o name 2>/dev/null | head -1); \
+	DEPLOY=$${DEPLOY:-$(WVA_CONTROLLER_DEPLOY)}; \
+	echo "Restarting $$DEPLOY..."; \
+	kubectl rollout restart -n $(BENCHMARK_NAMESPACE) $$DEPLOY; \
+	kubectl rollout status -n $(BENCHMARK_NAMESPACE) $$DEPLOY --timeout=$(WVA_ROLLOUT_TIMEOUT)
 
 BURSTY_WORKLOAD    ?= bursty.yaml
 BENCHMARK_WAIT_TIMEOUT ?= 7200
