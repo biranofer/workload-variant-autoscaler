@@ -602,13 +602,16 @@ def main():
             namespace=ns,
             prometheus_url=args.prometheus_url,
         )
-        print(f"  Applying primary ScaledObject: {primary_so_name}")
-        kubectl_apply(primary_so_obj, dry_run=args.dry_run)
-
+        # Delete the legacy HPA BEFORE creating the ScaledObject:
+        # KEDA's admission webhook rejects a ScaledObject if a managed HPA
+        # already targets the same deployment.
         if legacy_hpa is not None and not args.dry_run:
             hpa_name = legacy_hpa["metadata"]["name"]
-            print(f"  Deleting legacy direct HPA: {hpa_name}")
+            print(f"  Deleting legacy direct HPA first: {hpa_name}")
             kubectl_delete("hpa", hpa_name, ns, dry_run=args.dry_run)
+
+        print(f"  Applying primary ScaledObject: {primary_so_name}")
+        kubectl_apply(primary_so_obj, dry_run=args.dry_run)
     else:
         ann = primary_so.get("metadata", {}).get("annotations", {})
         model_id = ann.get("llm-d.ai/model-id") or detect_model_id(primary_dep) or dep_name
