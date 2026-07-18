@@ -457,13 +457,55 @@ def make_variant_scaledobject(dep_name, so_name, model_id, cost, min_replicas,
     }
 
 
-def make_trigger_authentication(namespace):
+def find_wva_token_secret(namespace):
+    """Return the name of the SA token Secret used by the WVA controller.
+
+    Looks for a kubernetes.io/service-account-token Secret whose
+    kubernetes.io/service-account.name annotation points at the WVA controller
+    manager ServiceAccount.  Works with both the current Kustomize install
+    (creates wva-controller-manager-token) and legacy Helm installs (which may
+    use a different name prefix).  Falls back to the Kustomize default if no
+    matching secret is found.
+    """
+    out = kubectl("get", "secret", "-n", namespace, "-o", "json", check=False)
+    try:
+        secrets = json.loads(out)["items"]
+    except (json.JSONDecodeError, KeyError):
+        secrets = []
+
+    for s in secrets:
+        if s.get("type") != "kubernetes.io/service-account-token":
+            continue
+        ann = s.get("metadata", {}).get("annotations", {})
+        sa_name = ann.get("kubernetes.io/service-account.name", "")
+        # Match any SA name that ends with "controller-manager" (covers both
+        # the Kustomize install "wva-controller-manager" and legacy names).
+        if sa_name.endswith("controller-manager"):
+            data = s.get("data", {})
+            if "token" in data and ("service-ca.crt" in data or "ca.crt" in data):
+                return s["metadata"]["name"]
+
+    # Fallback: standard Kustomize install name.
+    return "wva-controller-manager-token"
+
+
+def make_trigger_authentication(namespace, token_secret):
     """Build a KEDA TriggerAuthentication that borrows the WVA controller's SA token.
 
     The WVA ServiceAccount already holds cluster-monitoring-view, which is what
     Thanos Querier requires.  Without this, KEDA's Prometheus trigger gets 401
     and silently falls back to spec.fallback.replicas (=1), so scaling never fires.
     """
+    ca_key = "service-ca.crt"
+    # Check whether the secret actually has service-ca.crt; fall back to ca.crt.
+    out = kubectl("get", "secret", token_secret, "-n", namespace, "-o", "json", check=False)
+    try:
+        data = json.loads(out).get("data", {})
+        if ca_key not in data:
+            ca_key = "ca.crt"
+    except (json.JSONDecodeError, KeyError):
+        pass
+
     return {
         "apiVersion": "keda.sh/v1alpha1",
         "kind": "TriggerAuthentication",
@@ -475,13 +517,13 @@ def make_trigger_authentication(namespace):
             "secretTargetRef": [
                 {
                     "parameter": "bearerToken",
-                    "name": "workload-variant-autoscaler-controller-manager-token",
+                    "name": token_secret,
                     "key": "token",
                 },
                 {
                     "parameter": "ca",
-                    "name": "workload-variant-autoscaler-controller-manager-token",
-                    "key": "service-ca.crt",
+                    "name": token_secret,
+                    "key": ca_key,
                 },
             ],
         },
@@ -522,7 +564,9 @@ def main():
     print(f"      {dep_name}  (llm-d.ai/model={model_hash})")
 
     print(f"[2/3] Ensuring TriggerAuthentication for Thanos Querier access...")
-    trigger_auth = make_trigger_authentication(ns)
+    token_secret = find_wva_token_secret(ns)
+    print(f"      Using SA token secret: {token_secret}")
+    trigger_auth = make_trigger_authentication(ns, token_secret)
     kubectl_apply(trigger_auth, dry_run=args.dry_run)
 
     print(f"[3/4] Resolving primary ScaledObject...")
