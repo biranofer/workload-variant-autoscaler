@@ -1,0 +1,42 @@
+load:
+  type: constant
+  stages:
+  - rate: 2
+    duration: 300
+  - rate: 6
+    duration: 300
+  - rate: 10
+    duration: 300
+  request_timeout: 300
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+data:
+  type: random
+  input_distribution:
+    min: 3500
+    max: 4500
+    mean: 4000
+    std_dev: 200
+    total_count: 5000
+  output_distribution:
+    min: 800
+    max: 1200
+    mean: 1000
+    std_dev: 100
+    total_count: 5000
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    per_request: true
+storage:
+  local_storage:
+    path: /workspace

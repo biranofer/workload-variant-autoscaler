@@ -1,0 +1,12 @@
+target: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+model: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+name: "Prefill Heavy 15 RPS 900s"
+description: "4K/1K tokens, 15 RPS Poisson, 900s — matches PR 1308 baseline"
+request_type: text_completions
+profile: poisson
+rate: 15
+max_seconds: 900
+data:
+  prompt_tokens: 4000
+  output_tokens: 1000
+  seed: 42
