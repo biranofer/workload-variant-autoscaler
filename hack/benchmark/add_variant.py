@@ -434,6 +434,10 @@ def make_variant_scaledobject(dep_name, so_name, model_id, cost, min_replicas,
                 {
                     "type": "prometheus",
                     "name": "wva-desired-replicas",
+                    "authenticationRef": {
+                        "name": "wva-prometheus-auth",
+                        "kind": "TriggerAuthentication",
+                    },
                     "metadata": {
                         "serverAddress": prometheus_url,
                         "query": (
@@ -447,6 +451,37 @@ def make_variant_scaledobject(dep_name, so_name, model_id, cost, min_replicas,
                         "metricType": "Value",
                     },
                 }
+            ],
+        },
+    }
+
+
+def make_trigger_authentication(namespace):
+    """Build a KEDA TriggerAuthentication that borrows the WVA controller's SA token.
+
+    The WVA ServiceAccount already holds cluster-monitoring-view, which is what
+    Thanos Querier requires.  Without this, KEDA's Prometheus trigger gets 401
+    and silently falls back to spec.fallback.replicas (=1), so scaling never fires.
+    """
+    return {
+        "apiVersion": "keda.sh/v1alpha1",
+        "kind": "TriggerAuthentication",
+        "metadata": {
+            "name": "wva-prometheus-auth",
+            "namespace": namespace,
+        },
+        "spec": {
+            "secretTargetRef": [
+                {
+                    "parameter": "bearerToken",
+                    "name": "wva-controller-manager-token",
+                    "key": "token",
+                },
+                {
+                    "parameter": "ca",
+                    "name": "wva-controller-manager-token",
+                    "key": "service-ca.crt",
+                },
             ],
         },
     }
@@ -475,7 +510,7 @@ def main():
     cfg = load_variant_config(args.config)
     suffix = cfg["suffix"]
 
-    print(f"[1/3] Finding primary decode Deployment in namespace '{ns}'...")
+    print(f"[1/4] Finding primary decode Deployment in namespace '{ns}'...")
     primary_dep = find_primary_deployment(ns)
     dep_name = primary_dep["metadata"]["name"]
     model_hash = (primary_dep.get("spec", {}).get("selector", {})
@@ -485,7 +520,11 @@ def main():
     primary_gpu = _read_gpu_per_pod(primary_containers) or "1"
     print(f"      {dep_name}  (llm-d.ai/model={model_hash})")
 
-    print(f"[2/3] Resolving primary ScaledObject...")
+    print(f"[2/3] Ensuring TriggerAuthentication for Thanos Querier access...")
+    trigger_auth = make_trigger_authentication(ns)
+    kubectl_apply(trigger_auth, dry_run=args.dry_run)
+
+    print(f"[3/4] Resolving primary ScaledObject...")
     primary_so = find_managed_scaledobject(ns, dep_name)
     primary_so_name = f"{dep_name}-scaler"
 
@@ -532,7 +571,7 @@ def main():
         primary_so_name = primary_so["metadata"]["name"]
         print(f"      {primary_so_name}  (model-id={model_id}, cost={primary_cost})")
 
-    print(f"[3/3] Creating variant '{suffix}'  "
+    print(f"[4/4] Creating variant '{suffix}'  "
           f"variantCost={cfg['variantCost']}  modelID={model_id}")
 
     var_dep_name = f"{dep_name}-{suffix}"
