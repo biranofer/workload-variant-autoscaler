@@ -464,11 +464,11 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     axes[-1].set_xlabel("Time (UTC)")
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=timezone.utc))
 
-    final_prim = repls[-1][1] if repls else 0
-    final_v2 = repls[-1][2] if repls else 0
+    max_prim = max((r[1] for r in repls if r[1] is not None), default=0)
+    max_v2 = max((r[2] for r in repls if r[2] is not None), default=0)
     fig.suptitle(
         f"Two-Variant V2 — FULL PIPELINE {title_suffix}\n"
-        f"primary={final_prim}, v2={final_v2}  cost-aware",
+        f"primary max={max_prim}, v2 max={max_v2}  cost-aware",
         fontsize=10,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.97])
