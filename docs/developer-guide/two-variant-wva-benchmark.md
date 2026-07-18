@@ -72,22 +72,28 @@ The benchmark only works end-to-end when **all** of these are in place. The
 scenario yaml at [`hack/benchmark/scenarios/guides/two-variant-wva.yaml`](../../hack/benchmark/scenarios/guides/two-variant-wva.yaml)
 pins versions that satisfy these requirements out of the box.
 
-### 1. WVA chart and controller image at v0.8.0-rc5 or newer
+### 1. WVA controller image post-PR #1341 (required for KEDA path)
 
-The published chart and controller image must include:
+The KEDA ScaledObject path requires a WVA controller image that includes
+**PR #1341** ("fix: exclude KEDA-generated HPAs from the collector's
+managed-HPA index"). Without it, KEDA copies `llm-d.ai/managed: "true"` from
+the ScaledObject to its managed HPA, the locator finds both as managed scalers
+for the same deployment, returns an "ambiguous scale target" error, and all
+pod metrics are skipped — scaling never happens.
 
-- The `vllm-servicemonitor.yaml` template (propagates the per-pod
-  `llm-d.ai/variant` label into scraped metrics as `llm_d_ai_variant`, gated
-  by `wva.vllmService.enabled: true`). Without this, every reconcile prints
-  `No saturation metrics available for model, skipping analysis` and the
-  controller cannot scale.
-- The `cache_config_info` collector fixes (PR #1198) so the V2 analyzer
-  groups per-replica KV capacity correctly when more than one model lives
-  in the cluster.
+PR #1341 is included in the current main branch. It is **not** in `v0.8.0`
+or `v0.8.0-rc5`. Use a nightly build or wait for a release that follows
+`v0.8.0`.
 
-Both landed in `v0.8.0-rc1`. The scenario yaml pins both `chartVersions.wva`
-and `wva.image.tag` to `v0.8.0-rc5`. `v0.7.0` and earlier are missing one or
-both fixes — do not downgrade.
+Build a nightly image from main:
+```bash
+SHA=$(git rev-parse --short=8 HEAD)
+make docker-build docker-push IMG="ghcr.io/<your-org>/llm-d-workload-variant-autoscaler:nightly-${SHA}"
+```
+
+The controller image must also include:
+- The `cache_config_info` collector fixes (PR #1198) — in `v0.8.0-rc1` and later.
+- The `vllm-servicemonitor.yaml` template (PR #1145) — in `v0.8.0-rc1` and later.
 
 ### 2. Saturation V2 enabled via configmap
 
@@ -413,9 +419,21 @@ controller image are both at `v0.8.0-rc5` or newer
 ## Common failure modes
 
 - **`No saturation metrics available for model, skipping analysis` on every reconcile**
-  → Variant label not propagated. Verify the chart pinned in the scenario
-  yaml is `v0.8.0-rc5` or newer
-  ([Required pieces #1](#1-wva-chart-and-controller-image-at-v080-rc5-or-newer)).
+  with `Skipping pod that doesn't match any scale target` in the same log cycle
+  → WVA image is missing PR #1341. KEDA copies `llm-d.ai/managed: "true"` from
+  the ScaledObject to its managed HPA; the old image indexes both as managed
+  scalers for the same deployment, returns "ambiguous scale target", and skips
+  all pod metrics. Fix: use a WVA image that includes PR #1341
+  ([Required pieces #1](#1-wva-controller-image-post-pr-1341-required-for-keda-path)).
+- **`No active VariantAutoscalings found, skipping optimization` on every reconcile**
+  → ScaledObjects are missing the `wva.llmd.ai/controller-instance: <namespace>`
+  label. Namespace-scoped WVA deployments filter variants by this label; without
+  it all annotation-sourced VAs are silently dropped. `add_variant.py` sets this
+  label automatically. If you applied ScaledObjects manually, patch them:
+  `kubectl label scaledobject -n $NS --all wva.llmd.ai/controller-instance=$NS`
+- **`No saturation metrics available for model, skipping analysis` without pod-skip logs**
+  → Variant label not propagated by the PodMonitor. Verify `wva.vllmService.enabled: true`
+  in the scenario yaml creates a PodMonitor with `llm_d_ai_variant` relabeling.
 - **`Processing model (V1)` instead of `(V2)`**
   → Saturation configmap missing `analyzerName: saturation`. Run
   `make benchmark-enable-v2-saturation BENCHMARK_NAMESPACE=$NS`
