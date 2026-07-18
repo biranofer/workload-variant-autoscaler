@@ -389,6 +389,10 @@ def make_variant_scaledobject(dep_name, so_name, model_id, cost, min_replicas,
             "labels": {
                 # Required for namespace-scoped WVA controller-instance filtering.
                 "wva.llmd.ai/controller-instance": namespace,
+                # Required for WVA to resolve accelerator type for k1/k2 computation.
+                # Without this WVA emits with accelerator_type="unresolved" and withholds
+                # accelerator-specific saturation metrics.
+                "inference.optimization/acceleratorName": "NVIDIA-H100-80GB-HBM3",
             },
             "annotations": {
                 "llm-d.ai/managed": "true",
