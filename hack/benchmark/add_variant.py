@@ -440,6 +440,7 @@ def make_variant_scaledobject(dep_name, so_name, model_id, cost, min_replicas,
                     },
                     "metadata": {
                         "serverAddress": prometheus_url,
+                        "authModes": "bearer",
                         "query": (
                             f'wva_desired_replicas{{'
                             f'variant_name="{so_name}",'
@@ -474,12 +475,12 @@ def make_trigger_authentication(namespace):
             "secretTargetRef": [
                 {
                     "parameter": "bearerToken",
-                    "name": "wva-controller-manager-token",
+                    "name": "workload-variant-autoscaler-controller-manager-token",
                     "key": "token",
                 },
                 {
                     "parameter": "ca",
-                    "name": "wva-controller-manager-token",
+                    "name": "workload-variant-autoscaler-controller-manager-token",
                     "key": "service-ca.crt",
                 },
             ],
