@@ -96,7 +96,9 @@ def main():
             target = d.get("target")
             if target is None:
                 continue
-            tag = "v2" if variant.endswith("-v2") else "primary"
+            # KEDA ScaledObject names end in "-v2-scaler"; check for "-v2" anywhere
+            # after the deployment-name prefix, not just as a suffix.
+            tag = "v2" if ("-v2-" in variant or variant.endswith("-v2")) else "primary"
             bucket(ts_dt)[tag] = int(target)
             continue
 
