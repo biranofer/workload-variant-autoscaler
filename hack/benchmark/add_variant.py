@@ -20,13 +20,15 @@ The InferencePool created by the primary standup selects pods by:
   llm-d.ai/inferenceServing: "true"   (camelCase)
   llm-d.ai/model:            <hash>
 
-The primary Deployment selector additionally requires:
-  llm-d.ai/inference-serving: "true"  (kebab-case)
-
 The variant Deployment this script creates:
   - KEEPS  llm-d.ai/inferenceServing + llm-d.ai/model  → joins the pool
-  - OMITS  llm-d.ai/inference-serving (kebab)           → not claimed by primary
   - ADDS   wva.llmd.ai/variant: <suffix>                → unique selector
+  - ADDS   llm-d.ai/variant:    <variant-name>          → unique selector
+
+The primary Deployment's selector is whatever the standup created (it varies by
+deploy path: kustomize, Helm modelservice chart, etc.).  The primary never claims
+variant pods at runtime because Kubernetes ownerReferences make each pod owned by
+exactly one Deployment's ReplicaSet; a ReplicaSet only adopts orphan pods.
 
 All ScaledObjects share the same llm-d.ai/model-id annotation so the WVA
 solver groups them under one model and applies cost-weighted scaling.
@@ -159,8 +161,6 @@ def find_primary_deployment(namespace):
 
     def _is_primary(d):
         sel = d.get("spec", {}).get("selector", {}).get("matchLabels", {})
-        if sel.get("llm-d.ai/inference-serving") != "true":
-            return False
         if sel.get("llm-d.ai/role") != "decode":
             return False
         if "wva.llmd.ai/variant" in sel:
@@ -170,7 +170,8 @@ def find_primary_deployment(namespace):
     primaries = [d for d in items if _is_primary(d)]
     if not primaries:
         print("ERROR: No primary decode deployment found "
-              "(spec.selector: llm-d.ai/inference-serving=true,llm-d.ai/role=decode)",
+              "(spec.selector must include llm-d.ai/role=decode and must not "
+              "include wva.llmd.ai/variant)",
               file=sys.stderr)
         sys.exit(1)
     if len(primaries) > 1:
@@ -349,12 +350,10 @@ def make_variant_deployment(primary, cfg, namespace):
     spec["replicas"] = 1
 
     tmpl_labels = spec["template"]["metadata"].setdefault("labels", {})
-    tmpl_labels.pop("llm-d.ai/inference-serving", None)
     tmpl_labels["wva.llmd.ai/variant"] = suffix
     tmpl_labels["llm-d.ai/variant"] = sec_name
 
     sel = spec["selector"]["matchLabels"]
-    sel.pop("llm-d.ai/inference-serving", None)
     sel["wva.llmd.ai/variant"] = suffix
     sel["llm-d.ai/variant"] = sec_name
 
