@@ -99,6 +99,16 @@ Latency is statistically indistinguishable across the two schedulers on this wor
 - **KEDA-EPP oscillated 1 → 2 → 3 → 2 → 3** across 15 state transitions because Poisson bursts briefly pushed the `inference_objective_running_requests` metric across the 16/pod threshold, even though the *mean* rate was well within one pod's capacity.
 - Result: **KEDA-EPP spent 88 % more GPU-time and produced 30 errors while achieving statistically identical latency**. This is the clearest single-variant WVA advantage in the dataset: same SLO, roughly half the cost, no errors.
 
+#### Why did more pods produce more errors?
+
+Counter-intuitive at first — but the KEDA errors are *caused by* the extra scaling. Inspecting `per_request_lifecycle_metrics.json`:
+- 29 of 30 errors are `ClientPayloadError: "Response payload is not complete"` (streaming response cut mid-body).
+- The 30th is `HTTP Error 502` (bad gateway).
+- **All 30 fire in the same ~1-second window at t+516 s** into the run, which exactly matches the first KEDA scale-down event (`decode ready 3 → 2` at 20:43:37 UTC).
+- Failed requests each ran for ~30–33 s before erroring — the time they had been streaming from the pod that received SIGTERM.
+
+Root cause chain: Poisson burst → `running_requests` transiently > 16/pod → KEDA scales up → burst ends → scaleDown stabilization window (120 s) elapses → KEDA scales down → SIGTERM to a busy pod → in-flight streams die with `ClientPayloadError`. WVA never scaled, so no terminations, so no disruption. **Fewer pods produced fewer errors because the pods that existed were stable.**
+
 ## Graphs
 
 ### Replicas over time
