@@ -1,0 +1,56 @@
+# KEDA ScaledObject for biran namespace — EPP-driven scaling without WVA.
+# Mirrors the llm-d PR #1981 (docs(autoscaling): convert EPP autoscaling guide to KEDA)
+# with metric names as exposed by the EPP version on this cluster.
+#
+# PR metric names → cluster metric names:
+#   llm_d_epp_flow_control_queue_size  → inference_extension_flow_control_queue_size
+#   llm_d_epp_request_running          → inference_objective_running_requests
+#
+# No TriggerAuthentication needed: prometheus-proxy.openshift-keda handles auth internally.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: biran-keda-epp
+  namespace: biran
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: unsloth--6b24a594-instruct-decode
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  advanced:
+    horizontalPodAutoscalerConfig:
+      name: keda-hpa-biran-epp
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+  triggers:
+    - type: prometheus
+      name: epp-queue-size
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-proxy.openshift-keda:8080
+        query: >-
+          sum(inference_extension_flow_control_queue_size{namespace="biran",model_name="unsloth/Meta-Llama-3.1-8B-Instruct"})
+        threshold: "1"
+    - type: prometheus
+      name: epp-running-requests
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-proxy.openshift-keda:8080
+        query: >-
+          sum(inference_objective_running_requests{namespace="biran",model_name="unsloth/Meta-Llama-3.1-8B-Instruct"})
+        threshold: "16"
