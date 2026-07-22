@@ -1,0 +1,248 @@
+# WVA SAT-2 TP=1 SCENARIO — single-variant, WVA saturation-V2 autoscaling
+#
+# Deploys unsloth/Meta-Llama-3.1-8B-Instruct as a single TP=1 decode
+# deployment managed by WVA with the saturation-V2 cost-aware optimizer.
+#
+# Topology:
+#
+#   Gateway → InferencePool (EPP with flowControl)
+#                   |
+#           vLLM decode TP=1
+#           WVA controller (Sat-2) → KEDA ScaledObject
+#
+# Usage:
+#
+#   # Deploy
+#   make benchmark-standup BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1 \
+#     BENCHMARK_SKIP_PROMETHEUS_ADAPTER=true
+#
+#   # Register primary variant with WVA and create KEDA ScaledObject
+#   make benchmark-add-variant BENCHMARK_NAMESPACE=biran
+#
+#   # Enable saturation-V2 cost-aware optimizer
+#   make benchmark-enable-v2-saturation BENCHMARK_NAMESPACE=biran
+#
+#   # Run prefill-heavy workload
+#   make benchmark-run BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1 \
+#     BENCHMARK_HARNESS=inference-perf BENCHMARK_WORKLOAD=prefill_heavy_4k_2_6.yaml
+#
+#   # Wait for replicas to scale back to 1 (~10 min cooldown), then run decode-heavy
+#   make benchmark-run BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1 \
+#     BENCHMARK_HARNESS=inference-perf BENCHMARK_WORKLOAD=decode_heavy_1k_2_6.yaml
+#
+#   # Teardown
+#   make benchmark-teardown BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1
+
+# ============================================================================
+# SHARED
+# ============================================================================
+shared:
+  modelservice:
+    enabled: true
+  standalone:
+    enabled: false
+
+  # --------------------------------------------------------------------------
+  # WVA — saturation-V2 cost-aware optimizer
+  # --------------------------------------------------------------------------
+  wva:
+    enabled: true
+    wellLitPath: inference-scheduling
+    namespace: ""
+    image:
+      repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
+      tag: nightly-d6d39be4
+    replicaCount: 1
+    controller:
+      enabled: true
+    namespaceScoped: true
+    metrics:
+      enabled: true
+      port: 8443
+      secure: true
+    prometheus:
+      baseUrl: https://thanos-querier.openshift-monitoring.svc.cluster.local
+      port: 9091
+    vllmService:
+      enabled: true
+
+  chartVersions:
+    wva: 0.8.0-rc5
+    prometheusAdapter: 5.2.0
+
+  # --------------------------------------------------------------------------
+  # IMAGE OVERRIDES — pin vllm-openai to v0.14.0 so vllm:cache_config_info
+  # is emitted (required by WVA Sat-2 for real KV capacity).
+  # --------------------------------------------------------------------------
+  images:
+    vllmOpenai:
+      repository: docker.io/vllm/vllm-openai
+      tag: v0.14.0
+
+  # --------------------------------------------------------------------------
+  # EPP PLUGIN CONFIG — flowControl gate required for KEDA trigger
+  # --------------------------------------------------------------------------
+  inferenceExtension:
+    pluginsConfigFile: "wva-plugins.yaml"
+    pluginsCustomConfig:
+      wva-plugins.yaml: |
+        apiVersion: inference.networking.x-k8s.io/v1alpha1
+        kind: EndpointPickerConfig
+        featureGates:
+          - flowControl
+        plugins:
+          - type: queue-scorer
+          - type: kv-cache-utilization-scorer
+          - type: prefix-cache-scorer
+        schedulingProfiles:
+          - name: default
+            plugins:
+              - pluginRef: queue-scorer
+                weight: 2
+              - pluginRef: kv-cache-utilization-scorer
+                weight: 2
+              - pluginRef: prefix-cache-scorer
+                weight: 3
+
+  # --------------------------------------------------------------------------
+  # VLLM COMMON
+  # --------------------------------------------------------------------------
+  vllmCommon:
+    kvTransfer:
+      enabled: true
+      connector: NixlConnector
+      role: kv_both
+    flags:
+      enforceEager: true
+      disableLogRequests: true
+      disableUvicornAccessLog: true
+      allowLongMaxModelLen: "1"
+      serverDevMode: "1"
+    volumes:
+      - name: shared-config
+        type: emptyDir
+        emptyDir: {}
+      - name: dshm
+        type: emptyDir
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+    volumeMounts:
+      - name: dshm
+        mountPath: /dev/shm
+      - name: shared-config
+        mountPath: /shared-config
+
+  # --------------------------------------------------------------------------
+  # PREFILL / DECODE defaults (TP=1, single GPU per pod)
+  # --------------------------------------------------------------------------
+  prefill:
+    enabled: false
+    replicas: 0
+
+  decode:
+    initContainers:
+      - name: preprocess
+        imageKey: benchmark
+        imagePullPolicy: Always
+        command: ["set_llmdbench_environment.py", "-e", "/shared-config/llmdbench_env.sh", "-i"]
+        volumeMounts:
+          - name: shared-config
+            mountPath: /shared-config
+    parallelism:
+      tensor: 1
+      data: 1
+      dataLocal: 1
+      workers: 1
+    extraEnvVars: []
+    extraContainerConfig:
+      ports:
+        - containerPort: 5557
+          protocol: TCP
+        - containerPort: 8200
+          name: metrics
+          protocol: TCP
+      securityContext:
+        capabilities:
+          add:
+            - "IPC_LOCK"
+            - "SYS_RAWIO"
+        runAsGroup: 0
+        runAsUser: 0
+      imagePullPolicy: Always
+    additionalVolumeMounts: []
+    additionalVolumes: []
+    probes:
+      startup:
+        path: /v1/models
+        failureThreshold: 60
+        initialDelaySeconds: 15
+        periodSeconds: 30
+        timeoutSeconds: 5
+      liveness:
+        path: /health
+        failureThreshold: 3
+        periodSeconds: 10
+        timeoutSeconds: 5
+      readiness:
+        path: /v1/models
+        failureThreshold: 3
+        periodSeconds: 5
+        timeoutSeconds: 2
+    monitoring:
+      podmonitor:
+        enabled: true
+        portName: metrics
+        path: /metrics
+        interval: 30s
+        labels:
+          release: llmd
+
+  workDir: "~/data/wva-sat2-tp1"
+  harness:
+    name: inference-perf
+    experimentProfile: prefill_heavy_4k_2_6.yaml
+    # Prevent the entrypoint's 3-attempt retry loop from re-running the whole
+    # workload when inference-perf exits non-zero due to per-request errors.
+    # Without this, stage 1 errors (e.g. transient timeouts under load) trigger
+    # a full stage 0+stage 1 replay, which contaminates capture windows and
+    # overwrites run_metadata.yaml with the last attempt's timestamps.
+    extraEnvVars:
+      - name: LLMDBENCH_RUN_EXPERIMENT_HARNESS_MAX_TRIES
+        value: "1"
+
+  storage:
+    modelPvc:
+      size: 32Gi
+
+# ============================================================================
+# SCENARIO — single TP=1 variant
+# ============================================================================
+scenario:
+  - name: "llama-8b-tp1"
+
+    model:
+      name: unsloth/Meta-Llama-3.1-8B-Instruct
+      shortName: unsloth-meta-llama-3-1-8b-instruct
+      path: models/unsloth/Meta-Llama-3.1-8B-Instruct
+      huggingfaceId: unsloth/Meta-Llama-3.1-8B-Instruct
+      size: 32Gi
+      maxModelLen: 8192
+      blockSize: 64
+      gpuMemoryUtilization: 0.85
+
+    wva:
+      variantAutoscaling:
+        enabled: false
+      hpa:
+        enabled: false
+
+    decode:
+      replicas: 1
+      resources:
+        limits:
+          memory: 32Gi
+          cpu: "8"
+        requests:
+          memory: 32Gi
+          cpu: "8"
