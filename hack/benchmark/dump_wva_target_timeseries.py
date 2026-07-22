@@ -59,8 +59,29 @@ def main():
     def parse_iso(s):
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-    start = parse_iso(meta["harness_start"])
-    stop = parse_iso(meta["harness_stop"])
+    meta_start = parse_iso(meta["harness_start"])
+    meta_stop = parse_iso(meta["harness_stop"])
+
+    # When inference-perf runs multiple iterations, run_metadata.yaml records
+    # only the last iteration's start/stop. Use the raw metric scrape file
+    # timestamps (which span the entire collection window across all iterations)
+    # to widen the filter when they cover a longer range.
+    raw_dir = rd / "metrics" / "raw"
+    scrape_ts = []
+    fname_pat = re.compile(r"_(\d{10})_metrics\.log$")
+    if raw_dir.is_dir():
+        for f in raw_dir.iterdir():
+            m = fname_pat.search(f.name)
+            if m:
+                scrape_ts.append(int(m.group(1)))
+    if scrape_ts:
+        raw_start = datetime.fromtimestamp(min(scrape_ts), tz=timezone.utc)
+        raw_stop = datetime.fromtimestamp(max(scrape_ts), tz=timezone.utc)
+        start = min(meta_start, raw_start)
+        stop = max(meta_stop, raw_stop)
+    else:
+        start = meta_start
+        stop = meta_stop
 
     # Pull WVA logs covering the run window. We query "since" relative to now
     # plus a small buffer to ensure we capture the harness-start tick.
