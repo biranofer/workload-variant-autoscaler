@@ -128,7 +128,7 @@ def main():
             continue
         ts = int(m.group("ts"))
         pod = m.group("pod")
-        if "gaie-epp" in pod:
+        if "gaie-epp" in pod or "router-epp" in pod:
             ed = parse_epp_log(f)
             if ed:
                 epp_by_ts[ts] = ed["eppQueueSize"]
