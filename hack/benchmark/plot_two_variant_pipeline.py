@@ -234,7 +234,7 @@ def to_dt(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
-def plot(results_dir: Path, out_path: Path, title_suffix: str):
+def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[int] | None = None):
     decode_series, epp_series = collect(results_dir / "metrics" / "raw")
     drows = aggregate_decode(decode_series)
     erows = epp_panels(epp_series)
@@ -242,6 +242,13 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     wva_targets = wva_target_timeseries(results_dir)
     wva_sd = wva_supply_demand_timeseries(results_dir)
     cd_est = capacity_demand_estimate(results_dir)
+
+    # Detect whether a v2 variant was actually active in this run.
+    has_v2 = (
+        any(r[2] for r in repls)
+        or any(r.get("kv_v2") for r in drows)
+        or any(r.get("run_v2") for r in drows)
+    )
 
     has_supply_demand = bool(wva_sd or cd_est)
     epp_rates = epp_throughput(results_dir)
@@ -274,15 +281,17 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
     if repls:
         x = [to_dt(r[0]) for r in repls]
         ax.step(x, [r[1] for r in repls], where="post", color=PRIMARY_COLOR, label="primary (ready)", linewidth=2)
-        ax.step(x, [r[2] for r in repls], where="post", color=V2_COLOR, label="v2 (ready)", linewidth=2)
+        if has_v2:
+            ax.step(x, [r[2] for r in repls], where="post", color=V2_COLOR, label="v2 (ready)", linewidth=2)
     if wva_targets:
         xt = [to_dt(t[0]) for t in wva_targets]
         prim_t = [t[1] for t in wva_targets]
         v2_t = [t[2] for t in wva_targets]
         ax.step(xt, prim_t, where="post", color=PRIMARY_COLOR, linestyle="--", linewidth=1.4,
                 label="primary (WVA target)", alpha=0.8)
-        ax.step(xt, v2_t, where="post", color=V2_COLOR, linestyle="--", linewidth=1.4,
-                label="v2 (WVA target)", alpha=0.8)
+        if has_v2:
+            ax.step(xt, v2_t, where="post", color=V2_COLOR, linestyle="--", linewidth=1.4,
+                    label="v2 (WVA target)", alpha=0.8)
     ax.set_ylabel("Replicas")
     ax.legend(loc="upper left", fontsize=7)
     ax.grid(alpha=0.3)
@@ -345,11 +354,12 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
 
     # 2. KV Cache Utilization
     ax = axes[1 + base]
-    ax.set_title("KV Cache Utilization (avg per variant)")
+    ax.set_title("KV Cache Utilization (avg per variant)" if has_v2 else "KV Cache Utilization")
     if drows:
         x = [to_dt(r["ts"]) for r in drows]
         ax.plot(x, [r["kv_primary"] for r in drows], color=PRIMARY_COLOR, label="primary")
-        ax.plot(x, [r["kv_v2"] for r in drows], color=V2_COLOR, label="v2")
+        if has_v2:
+            ax.plot(x, [r["kv_v2"] for r in drows], color=V2_COLOR, label="v2")
     ax.set_ylabel("KV %")
     ax.set_ylim(0, 100)
     ax.legend(loc="upper right", fontsize=8)
@@ -357,22 +367,24 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
 
     # 3. Requests Running
     ax = axes[2 + base]
-    ax.set_title("Requests Running (sum per variant)")
+    ax.set_title("Requests Running (sum per variant)" if has_v2 else "Requests Running")
     if drows:
         x = [to_dt(r["ts"]) for r in drows]
         ax.plot(x, [r["run_primary"] for r in drows], color=PRIMARY_COLOR, label="primary")
-        ax.plot(x, [r["run_v2"] for r in drows], color=V2_COLOR, label="v2")
+        if has_v2:
+            ax.plot(x, [r["run_v2"] for r in drows], color=V2_COLOR, label="v2")
     ax.set_ylabel("Running")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.3)
 
     # 4. Requests Waiting
     ax = axes[3 + base]
-    ax.set_title("vLLM Requests Waiting (sum per variant)")
+    ax.set_title("vLLM Requests Waiting (sum per variant)" if has_v2 else "vLLM Requests Waiting")
     if drows:
         x = [to_dt(r["ts"]) for r in drows]
         ax.plot(x, [r["wait_primary"] for r in drows], color=PRIMARY_COLOR, label="primary")
-        ax.plot(x, [r["wait_v2"] for r in drows], color=V2_COLOR, label="v2")
+        if has_v2:
+            ax.plot(x, [r["wait_v2"] for r in drows], color=V2_COLOR, label="v2")
     ax.set_ylabel("Waiting")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.3)
@@ -385,7 +397,8 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
         ax.plot(x, [r["fc_queue"] for r in erows], color="black", label="flow_control_queue (gateway)")
         ax.plot(x, [r["pool_avg"] for r in erows], color="orange", label="pool_average_queue", alpha=0.8)
         ax.plot(x, [r["per_pod_primary"] for r in erows], color=PRIMARY_COLOR, linestyle="--", label="per pod sum: primary")
-        ax.plot(x, [r["per_pod_v2"] for r in erows], color=V2_COLOR, linestyle="--", label="per pod sum: v2")
+        if has_v2:
+            ax.plot(x, [r["per_pod_v2"] for r in erows], color=V2_COLOR, linestyle="--", label="per pod sum: v2")
         ax.set_ylabel("Requests in queue")
         ax.legend(loc="upper left", fontsize=7)
         ax.grid(alpha=0.3)
@@ -451,26 +464,51 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str):
         ax.grid(alpha=0.3)
         ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
 
-    # Bound the x-axis to the active window (load + scale-down), clipping the
-    # dead/zero tail after collection so the load isn't squished into the left.
-    act = [r["timestamp"] for r in cd_est] if cd_est else []
+    # Bound x-axis to all available data (not just replicas > 1) so the full
+    # run window is visible, including the initial low-load stage.
+    all_ts: list[int] = []
     if repls:
-        act += [t[0] for t in repls if (t[1] or 0) > 1 or (t[2] or 0) > 1]
-    if act:
-        lo, hi = min(act), max(act)
+        all_ts += [t[0] for t in repls]
+    if drows:
+        all_ts += [r["ts"] for r in drows]
+    if cd_est:
+        all_ts += [r["timestamp"] for r in cd_est]
+    if all_ts:
+        lo, hi = min(all_ts), max(all_ts)
         span = max(hi - lo, 60)
-        axes[-1].set_xlim(to_dt(lo - span * 0.03), to_dt(hi + span * 0.05))
+        x_lo = to_dt(lo - span * 0.02)
+        x_hi = to_dt(hi + span * 0.04)
+        axes[-1].set_xlim(x_lo, x_hi)
+
+        # Draw vertical stage-transition lines on every panel.
+        if stage_sec:
+            for ax in axes:
+                for s in stage_sec:
+                    t_stage = to_dt(lo + s)
+                    ax.axvline(t_stage, color="gray", linestyle="--",
+                               linewidth=1.0, alpha=0.7)
+            # Label only on the top panel.
+            for i, s in enumerate(stage_sec):
+                t_stage = to_dt(lo + s)
+                axes[0].text(
+                    t_stage, axes[0].get_ylim()[1],
+                    f" stage {i + 1}",
+                    fontsize=7, color="gray", va="top", ha="left",
+                )
 
     axes[-1].set_xlabel("Time (UTC)")
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=timezone.utc))
 
     max_prim = max((r[1] for r in repls if r[1] is not None), default=0)
     max_v2 = max((r[2] for r in repls if r[2] is not None), default=0)
-    fig.suptitle(
-        f"Two-Variant V2 — FULL PIPELINE {title_suffix}\n"
-        f"primary max={max_prim}, v2 max={max_v2}  cost-aware",
-        fontsize=10,
-    )
+    if has_v2:
+        suptitle = (
+            f"Two-Variant V2 — FULL PIPELINE {title_suffix}\n"
+            f"primary max={max_prim}, v2 max={max_v2}  cost-aware"
+        )
+    else:
+        suptitle = f"KEDA Pipeline {title_suffix}\nprimary max={max_prim}"
+    fig.suptitle(suptitle, fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(out_path, dpi=120)
     print(f"Wrote {out_path}")
@@ -481,11 +519,17 @@ def main():
     ap.add_argument("results_dir", help="Path to .../results/<treatment>_<i>")
     ap.add_argument("--name", default="two_variant_v2_full_pipeline.png")
     ap.add_argument("--suffix", default="")
+    ap.add_argument(
+        "--stage-sec",
+        default="",
+        help="Comma-separated seconds from run start for stage-change lines (e.g. 300,1020)",
+    )
     args = ap.parse_args()
+    stage_sec = [int(s) for s in args.stage_sec.split(",") if s.strip()] if args.stage_sec else None
     rd = Path(args.results_dir).resolve()
     out = rd / "metrics" / "graphs" / args.name
     out.parent.mkdir(parents=True, exist_ok=True)
-    plot(rd, out, args.suffix)
+    plot(rd, out, args.suffix, stage_sec=stage_sec)
 
 
 if __name__ == "__main__":

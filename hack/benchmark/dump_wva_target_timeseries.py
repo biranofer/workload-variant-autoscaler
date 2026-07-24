@@ -41,6 +41,21 @@ ANALYSIS_PAT = re.compile(
     r'V2 saturation analysis completed\t'
     r'(?P<json>\{.*\})$'
 )
+# Newer controller builds renamed the analysis log line to "analyzer-result"
+# and shortened its field names (supply/demand/util/rc/sc instead of
+# totalSupply/totalDemand/utilization/requiredCapacity/spareCapacity).
+ANALYZER_RESULT_PAT = re.compile(
+    r'^(?P<ts>\S+)\t\S+\tsaturation/engine_v2\.go:\d+\t'
+    r'analyzer-result\t'
+    r'(?P<json>\{.*\})$'
+)
+ANALYZER_RESULT_FIELD_MAP = {
+    "supply": "totalSupply",
+    "demand": "totalDemand",
+    "util": "utilization",
+    "rc": "requiredCapacity",
+    "sc": "spareCapacity",
+}
 
 
 def main():
@@ -137,6 +152,21 @@ def main():
                       "requiredCapacity", "spareCapacity"):
                 if k in d:
                     b[k] = d[k]
+            continue
+
+        m = ANALYZER_RESULT_PAT.match(line)
+        if m:
+            try:
+                ts_dt = parse_iso(m.group("ts"))
+                if ts_dt < start or ts_dt > stop:
+                    continue
+                d = json.loads(m.group("json"))
+            except (ValueError, json.JSONDecodeError):
+                continue
+            b = bucket(ts_dt)
+            for short, long in ANALYZER_RESULT_FIELD_MAP.items():
+                if short in d:
+                    b[long] = d[short]
 
     samples = []
     for ts, b in sorted(samples_by_ts.items()):

@@ -11,12 +11,12 @@ Table formatting rules for this doc (keep alignment readable in the raw editor):
 
 # WVA (Sat-2) vs KEDA-EPP autoscaling — fair comparison
 
-Date: 2026-07-22
+Date: 2026-07-22 – 2026-07-24
 Namespace: `biran` (pokprod001)
 Model: `unsloth/Meta-Llama-3.1-8B-Instruct` (TP=1)
 Harness: inference-perf v0.7.0
 
-Eight back-to-back runs on the same cluster and model service (two constant-arrival workloads + two Poisson workloads, each run under both schedulers); only the autoscaling controller loop was swapped between runs.
+Ten back-to-back runs on the same cluster and model service (two constant-arrival workloads + three Poisson workloads, each run under both schedulers); only the autoscaling controller loop was swapped between runs.
 
 ## Setup
 
@@ -38,6 +38,7 @@ Workloads (inference-perf, all 2 → 10 RPS with 5-min warm-up + 12-min saturati
 - **prefill-heavy** (constant arrival): input 4K tokens, output 100 tokens.
 - **decode-heavy** (constant arrival): input 100 tokens, output 2K tokens.
 - **symmetric 300/300** (Poisson arrival): input ≈300 tokens, output ≈300 tokens. Fits in one pod; probes scheduler stability under arrival jitter.
+- **symmetric 800/800** (Poisson arrival): input ≈800 tokens, output ≈800 tokens. Sits right at one pod's KV capacity edge; probes the transition zone between the two workloads below/above.
 - **symmetric 1200/1200** (Poisson arrival): input ≈1200 tokens, output ≈1200 tokens. **Exceeds one pod's KV capacity**, so both schedulers must scale; probes scale-up + scale-down behaviour under bursts.
 
 **Load profile**: the two constant-arrival workloads use `load.type: constant` — requests fire at strictly fixed inter-arrival times. The third workload uses `load.type: poisson`, which draws inter-arrival intervals from an exponential distribution at the same mean rate. Poisson arrivals produce short bursts even at a modest mean and expose reactive schedulers' sensitivity to instantaneous rates.
@@ -110,6 +111,36 @@ Counter-intuitive at first — but the KEDA errors are *caused by* the extra sca
 
 Root cause chain: Poisson burst → `running_requests` transiently > 16/pod → KEDA scales up → burst ends → scaleDown stabilization window (120 s) elapses → KEDA scales down → SIGTERM to a busy pod → in-flight streams die with `ClientPayloadError`. WVA never scaled, so no terminations, so no disruption. **Fewer pods produced fewer errors because the pods that existed were stable.**
 
+### Symmetric 800/800 — Poisson arrival (intermediate scale point)
+
+At 800 in + 800 out tokens, load sits right at the edge of one pod's KV capacity — a middle point between symmetric 300/300 (fits in 1 pod) and symmetric 1200/1200 (clearly needs 9–10 pods).
+
+| metric                   |    WVA-800 | KEDA-800 |
+|--------------------------|------------|----------|
+| requests                 |       7200 |     7200 |
+| successful               |   **7200** |     7186 |
+| errors                   |      **0** |       14 |
+| error rate               |  **0.00%** |    0.19% |
+| achieved RPS             |       9.84 |     9.90 |
+| avg ready replicas       |   **1.00** |     4.06 |
+| max ready                |      **1** |        7 |
+| max desired              |      **1** |        7 |
+| state transitions        |      **1** |        8 |
+| TTFT p50 (ms)            |       83.3 | **42.8** |
+| TTFT p95 (ms)            |      125.7 | **66.3** |
+| TTFT p99 (ms)            |      149.7 | **86.7** |
+| Request latency p50 (ms) |     15,573 | **7760** |
+| Request latency p95 (ms) |     18,856 | **9159** |
+| Request latency p99 (ms) |     20,063 | **9721** |
+| TPOT p50 (ms)            |       19.9 |  **9.7** |
+| TPOT p95 (ms)            |       35.7 | **17.9** |
+
+**A clear cost/reliability-vs-latency tradeoff at exactly the capacity edge.** WVA's controller logs (captured cleanly on this run) show KV utilization peaked at **64%** — never crossing the 85% scaleUp threshold — so it correctly, consistently held at 1 replica for the entire run. That makes WVA **4× cheaper** (1.00 vs 4.06 avg pods) and **more reliable** (0 vs 14 errors) than KEDA-EPP here, but at roughly **2× the latency** across every percentile: one pod queues the full 10 RPS Poisson load instead of spreading it across ~4.
+
+KEDA-EPP's 14 errors reproduce the same pattern documented above: all fire in the same ~1-second window (`ClientPayloadError`, mid-stream cut) at a scale-down event.
+
+*Note on reproducibility: an earlier attempt at this exact workload (same config, different Poisson draw) showed WVA ramping to 6 replicas instead of holding at 1 — its controller logs were lost to a process interruption before they could be captured, so that run isn't included here. Since inference-perf's Poisson arrivals aren't seed-fixed, two runs at the same nominal 10 RPS can land on opposite sides of an 85%-utilization threshold purely from randomness in the burst pattern — symmetric 800/800 was chosen specifically because it sits at that edge. This run's numbers are used above because its controller-decision data (supply/demand/utilization per reconcile) was fully captured, unlike the discarded one.*
+
 ### Symmetric 1200/1200 — Poisson arrival (both must scale)
 
 At 1200 in + 1200 out tokens per request, one pod's KV supply (~336 K tokens) is no longer enough at 10 RPS — both schedulers had to scale up.
@@ -145,6 +176,8 @@ Contrast with KEDA-EPP, which keyed off `running_requests` (not "spare KV capaci
 WVA is more measured at ramp-up but too eager at ramp-down: it releases capacity as soon as "supply comfortably exceeds current in-use demand", without accounting for the fact that the mid-flight requests holding those pods busy can't survive a pod restart.
 
 ## Graphs
+
+*The three aggregate charts below predate the symmetric 800/800 run and still show only the original 4 workloads. Per-run pipeline plots for 800/800 exist at `<results dir>/metrics/graphs/two_variant_v2_full_pipeline.png` for each of the two runs listed under Reproducing; the aggregate charts have not been regenerated to include a 5th workload.*
 
 ### Replicas over time
 
@@ -184,6 +217,9 @@ WVA is more measured at ramp-up but too eager at ramp-down: it releases capacity
 1. **Symmetric 300/300 with Poisson**: same latency, 88 % less compute, zero errors vs 30. Model-aware demand estimation refuses to react to bursts that fit inside the current pod's KV capacity.
 2. **Model-aware demand estimation** in general: WVA won't scale up on transient noise that doesn't reflect sustained pressure.
 
+**Where WVA trades latency for cost and reliability (right at one pod's capacity edge):**
+- **Symmetric 800/800 Poisson**: WVA held at 1 replica the whole run (KV util peaked at 64%, below its 85% scaleUp threshold) — 4× cheaper and zero errors vs KEDA-EPP's 4.06 avg pods and 14 errors, but ~2× the latency at every percentile. Whether WVA scales here at all is sensitive to the specific (non-seeded) Poisson realization — a different run of the identical config showed it ramping to 6 pods instead. This is the transition zone between WVA's headroom advantage (300/300) and KEDA's saturation advantage (1200/1200): the outcome is genuinely workload-realization-dependent, not a stable middle ground.
+
 **A recurring failure mode — mid-run scale-down killing in-flight streams:**
 Both schedulers exhibit it, at different times:
 - **KEDA-EPP on 300/300 Poisson** (T+516 s): running_requests briefly dropped, HPA scaled 3→2, streaming client on the terminating pod got `ClientPayloadError` × 30.
@@ -193,15 +229,16 @@ Both schedulers exhibit it, at different times:
 Neither scheduler currently accounts for "how many in-flight streaming requests would die if I terminate this pod right now?" — the KEDA HPA `terminationGracePeriodSeconds` + vLLM's shutdown handling could bridge this, but neither is tuned for the multi-second inference latency here.
 
 **What single-variant experiments don't measure — WVA's cost-aware optimizer:**
-- WVA's cost-aware V2 optimizer only differentiates variants when there are **multiple variants** (e.g., primary at TP=2 and secondary at TP=1 with different `cost` weights). All 8 runs above use a single TP=1 variant, so WVA's efficiency-vs-latency tradeoff collapses to "hold min pods that satisfy the demand model" — a scenario the current threshold configuration doesn't handle well under sustained load.
+- WVA's cost-aware V2 optimizer only differentiates variants when there are **multiple variants** (e.g., primary at TP=2 and secondary at TP=1 with different `cost` weights). All 10 runs above use a single TP=1 variant, so WVA's efficiency-vs-latency tradeoff collapses to "hold min pods that satisfy the demand model" — a scenario the current threshold configuration doesn't handle well under sustained load.
 - KEDA-EPP's two triggers (`queue`=1 and `running`=16) were picked to match the WVA setup's intent, but at these thresholds KEDA is biased to over-react on any load mild enough that WVA would ignore it.
 
 ## Honest conclusions
 
 1. **KEDA-EPP is aggressive; WVA is measured.** Aggression wins on saturating workloads; measure wins on workloads with real headroom.
 2. **The clearest single-variant WVA advantage is at symmetric 300/300 Poisson**: same SLO, 88 % less compute, zero errors. When the load truly fits in one pod, WVA correctly refuses to react to Poisson noise. Any workload with real-world arrival jitter and headroom-to-spare replicates this shape.
-3. **WVA under-performs on any workload that saturates a pod under sustained load.** Its scaleUpThreshold (85 % KV util) and scaleDown boundary (70 %) trigger a target-drop the moment all pods become ready — releasing capacity while load is still active and causing streaming errors. Two straightforward tuning knobs would help: (a) raise scaleDown boundary so pods stay longer once brought up, (b) add a "min pods to hold during stage 1" hysteresis so mid-run releases don't churn.
-4. **The full two-variant WVA story remains unexplored here.** Prior work (`project-two-variant-experiment`) showed WVA ~36 % cheaper than HPA-EPP-50/50 at equal SLO with two variants. That's the head-to-head that would show WVA's design payoff on its intended axis.
+3. **At exactly the capacity edge (symmetric 800/800 Poisson), WVA's outcome depends on the specific Poisson draw, not just the mean rate.** In the run reported here, WVA held at 1 replica (KV util peaked at 64%, under its 85% threshold) — 4× cheaper and zero errors vs KEDA-EPP, but ~2× the latency. A different run of the identical config crossed the threshold and ramped to 6 pods instead. Because inference-perf's Poisson arrivals aren't seed-fixed, this workload can't be treated as a single stable data point — it's a real illustration of threshold-based scaling's sensitivity to burst timing near a boundary.
+4. **WVA under-performs on any workload that saturates a pod under sustained load.** Its scaleUpThreshold (85 % KV util) and scaleDown boundary (70 %) trigger a target-drop the moment all pods become ready — releasing capacity while load is still active and causing streaming errors. Two straightforward tuning knobs would help: (a) raise scaleDown boundary so pods stay longer once brought up, (b) add a "min pods to hold during stage 1" hysteresis so mid-run releases don't churn.
+5. **The full two-variant WVA story remains unexplored here.** Prior work (`project-two-variant-experiment`) showed WVA ~36 % cheaper than HPA-EPP-50/50 at equal SLO with two variants. That's the head-to-head that would show WVA's design payoff on its intended axis.
 
 ## Recommendations
 
@@ -226,6 +263,8 @@ Each run is at:
 | KEDA-EPP decode (const)                | `biran-20260722-164602-489/results/inference-perf-1784728018-vsnfl4_1/` |
 | WVA symmetric 300/300 (poisson)        | `biran-20260722-223301-790/results/inference-perf-1784748830-ge3fgu_1/` |
 | KEDA-EPP symmetric 300/300 (poisson)   | `biran-20260722-233247-978/results/inference-perf-1784752466-0yjpyg_1/` |
+| WVA symmetric 800/800 (poisson)        | `biran-20260724-173729-660/results/inference-perf-1784903893-ys0vog_1/` |
+| KEDA-EPP symmetric 800/800 (poisson)   | `biran-20260724-102958-963/results/inference-perf-1784878246-kwssn1_1/` |
 | WVA symmetric 1200/1200 (poisson)      | `biran-20260723-154507-242/results/inference-perf-1784810752-pbd8hi_1/` |
 | KEDA-EPP symmetric 1200/1200 (poisson) | `biran-20260723-174703-702/results/inference-perf-1784818070-8c8wez_1/` |
 

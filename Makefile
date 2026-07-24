@@ -349,10 +349,14 @@ benchmark-install: ## Clone llm-d-benchmark at BENCHMARK_REPO_REF (default v0.7.
 		echo "llm-d-benchmark already cloned at $(BENCHMARK_REPO_DIR); checking out $(BENCHMARK_REPO_REF)..."; \
 		cd $(BENCHMARK_REPO_DIR) && git fetch --tags && git checkout $(BENCHMARK_REPO_REF); \
 	fi
-	@cd $(BENCHMARK_REPO_DIR) && ./install.sh $(if $(filter true,$(BENCHMARK_UV)),--uv,--no-uv)
+	@if command -v llmdbenchmark >/dev/null 2>&1 || [ -f "$(BENCHMARK_VENV)/bin/llmdbenchmark" ]; then \
+		echo "llmdbenchmark already installed — skipping install.sh"; \
+	else \
+		cd $(BENCHMARK_REPO_DIR) && ./install.sh $(if $(filter true,$(BENCHMARK_UV)),--uv,--no-uv); \
+	fi
 	@echo "Upgrading helm-diff to v3.15.10 for Helm 4 compatibility..."
 	@helm plugin uninstall diff 2>/dev/null || true
-	@helm plugin install https://github.com/databus23/helm-diff --version v3.15.10 --verify=false 2>&1
+	@helm plugin install https://github.com/databus23/helm-diff --version v3.15.10 2>&1 || true
 
 .PHONY: benchmark-standup
 benchmark-standup: ## Stand up the benchmark environment (set BENCHMARK_NAMESPACE=<namespace>, MODEL_ID=<model>; BENCHMARK_DIRECT_KEDA=true for controller-free EPP+KEDA autoscaling instead of WVA)
