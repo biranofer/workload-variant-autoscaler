@@ -177,15 +177,16 @@ WVA is more measured at ramp-up but too eager at ramp-down: it releases capacity
 
 ## Graphs
 
-*The three aggregate charts below predate the symmetric 800/800 run and still show only the original 4 workloads. Per-run pipeline plots for 800/800 exist at `<results dir>/metrics/graphs/two_variant_v2_full_pipeline.png` for each of the two runs listed under Reproducing; the aggregate charts have not been regenerated to include a 5th workload.*
+*The replicas-over-time chart below covers all 5 workloads. The latency and cost/error charts further down still predate the symmetric 800/800 run and show only the original 4 workloads — per-run pipeline plots for 800/800 exist at `<results dir>/metrics/graphs/two_variant_v2_full_pipeline.png` for each of the two runs listed under Reproducing.*
 
 ### Replicas over time
 
-![Replicas over time — all 4 workloads](img/replicas_timeline.png)
+![Replicas over time — all 5 workloads](img/replicas_timeline.png)
 
 - **Prefill 4K/100 (constant)**: WVA climbs to 8 in ~9 min. KEDA-EPP rockets 1→10 in ~45 s, then oscillates 1↔4↔2↔3 as the queue metric bounces.
 - **Decode 100/2K (constant)**: WVA climbs to 7 then drops to 1 mid-run (WVA's 186 errors happen at that drop). KEDA-EPP holds at 10 for the entire stage 1, drops only after load ends.
 - **Symmetric 300/300 (Poisson)**: WVA stays flat at 1 (correct — the load fits in one pod). KEDA-EPP oscillates 1↔2↔3 because Poisson bursts trip the `running_requests > 16/pod` threshold intermittently.
+- **Symmetric 800/800 (Poisson)**: WVA stays flat at 1 the entire run (KV util peaked at 64%, under its 85% scaleUp threshold). KEDA-EPP ramps to 6–7 and holds there for most of stage 1 — the two curves visually make the cost/latency tradeoff in this section's table obvious.
 - **Symmetric 1200/1200 (Poisson)**: WVA climbs to 9 then drops to 2 as soon as all pods come online (this drop causes 104 errors from in-flight-stream termination). KEDA-EPP climbs to 10 and holds throughout stage 1.
 
 ### Latency — TTFT and request latency at each percentile (log scale)
