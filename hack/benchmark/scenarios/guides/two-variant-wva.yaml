@@ -86,8 +86,8 @@ shared:
     wellLitPath: inference-scheduling
     namespace: ""
     image:
-      repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
-      tag: v0.8.0-rc5
+      repository: ghcr.io/biranofer/llm-d-workload-variant-autoscaler
+      tag: nightly-73e1548b
     replicaCount: 1
     controller:
       enabled: true
@@ -260,7 +260,20 @@ shared:
   workDir: "~/data/two-variant-wva"
   harness:
     name: inference-perf
-    experimentProfile: shared_prefix_synthetic.yaml
+    experimentProfile: prefill_heavy_4k1k_2_10.yaml
+    # Default harness pod memory (32Gi) OOMKilled mid-run on this workload's
+    # 1000-token mean output — the first run of this repo's benchmarks at
+    # that output length (prior workloads topped out at 800). Bumped for
+    # headroom; nodes have ~2TB allocatable so this costs nothing.
+    resources:
+      cpu: 16
+      memory: 64Gi
+    # Prevent the entrypoint's 3-attempt retry loop from re-running the whole
+    # workload on transient per-request errors, which would contaminate
+    # capture windows and overwrite run_metadata.yaml's timestamps.
+    extraEnvVars:
+      - name: LLMDBENCH_RUN_EXPERIMENT_HARNESS_MAX_TRIES
+        value: "1"
 
   storage:
     modelPvc:

@@ -1,0 +1,45 @@
+load:
+  type: poisson
+  stages:
+  - rate: 2
+    duration: 300
+  - rate: 10
+    duration: 720
+  request_timeout: 300
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+  base_url: REPLACE_ENV_LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: REPLACE_ENV_LLMDBENCH_DEPLOY_CURRENT_MODEL
+data:
+  type: random
+  input_distribution:
+    min: 3500
+    max: 4500
+    mean: 4000
+    std_dev: 200
+    total_count: 5000
+  output_distribution:
+    min: 800
+    max: 1200
+    mean: 1000
+    std_dev: 100
+    total_count: 5000
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    # per_request disabled: at 1000-token mean output this generates a
+    # multi-GB JSON (observed 5GB+, still growing) that OOMKilled the
+    # harness pod at the 32Gi default and took 45+ min to collect even at
+    # 64Gi. Nothing in hack/benchmark/*.py reads per-request data — only
+    # summary/per_stage are consumed by the comparison pipeline.
+    per_request: false
+storage:
+  local_storage:
+    path: /workspace

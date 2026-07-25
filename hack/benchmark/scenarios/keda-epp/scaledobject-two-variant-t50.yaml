@@ -1,0 +1,105 @@
+# Two-variant KEDA-EPP baseline — queue threshold=50, running-requests
+# threshold=16 (same as scaledobject-t50.yaml). Both ScaledObjects below
+# read the IDENTICAL pool-wide, model-scoped EPP query — EPP does not
+# expose a per-Deployment breakdown of queue depth or running requests,
+# so this is the only signal a naive KEDA-EPP setup can use per variant.
+# They will scale in lockstep, with no cost awareness between the TP=2
+# primary and TP=1 variant. Apply after `make benchmark-add-variant` on
+# guides/keda-epp-two-variant, replacing the wva_desired_replicas-triggered
+# ScaledObjects add_variant.py creates by default (there is no WVA
+# controller running in this scenario to drive them).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: biran-keda-epp-primary
+  namespace: biran
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: unsloth--6b24a594-instruct-decode
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  advanced:
+    horizontalPodAutoscalerConfig:
+      name: keda-hpa-biran-epp-primary
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+  triggers:
+    - type: prometheus
+      name: epp-queue-size
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-proxy.openshift-keda:8080
+        query: >-
+          sum(inference_extension_flow_control_queue_size{namespace="biran",model_name="unsloth/Meta-Llama-3.1-8B-Instruct"})
+        threshold: "50"
+    - type: prometheus
+      name: epp-running-requests
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-proxy.openshift-keda:8080
+        query: >-
+          sum(inference_objective_running_requests{namespace="biran",model_name="unsloth/Meta-Llama-3.1-8B-Instruct"})
+        threshold: "16"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: biran-keda-epp-variant
+  namespace: biran
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: unsloth--6b24a594-instruct-decode-v2
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  advanced:
+    horizontalPodAutoscalerConfig:
+      name: keda-hpa-biran-epp-variant
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+  triggers:
+    - type: prometheus
+      name: epp-queue-size
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-proxy.openshift-keda:8080
+        query: >-
+          sum(inference_extension_flow_control_queue_size{namespace="biran",model_name="unsloth/Meta-Llama-3.1-8B-Instruct"})
+        threshold: "50"
+    - type: prometheus
+      name: epp-running-requests
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-proxy.openshift-keda:8080
+        query: >-
+          sum(inference_objective_running_requests{namespace="biran",model_name="unsloth/Meta-Llama-3.1-8B-Instruct"})
+        threshold: "16"

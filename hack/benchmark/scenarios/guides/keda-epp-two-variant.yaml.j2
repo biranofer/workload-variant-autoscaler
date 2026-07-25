@@ -1,0 +1,21 @@
+# [REQUIRED]
+{% set base_dir = base_dir | default('../') -%}
+base_dir: {{ base_dir }}
+
+# [REQUIRED]
+values_file:
+  path: {{ base_dir }}/config/templates/values/defaults.yaml
+
+# [REQUIRED]
+template_dir:
+  path: {{ base_dir }}/config/templates/jinja
+
+# [OPTIONAL]
+scenario_file:
+  path: {{ base_dir }}/config/scenarios/guides/keda-epp-two-variant.yaml
+
+# Same model deployed as two variants (primary TP=2, added variant TP=1) in
+# one shared InferencePool/EPP, but with NO WVA — both variants are scaled
+# by independent ScaledObjects reading the same pool-wide EPP queue-depth /
+# running-requests signal. This is the naive-KEDA baseline compared against
+# guides/two-variant-wva.yaml's cost-aware sat-v2 optimizer.

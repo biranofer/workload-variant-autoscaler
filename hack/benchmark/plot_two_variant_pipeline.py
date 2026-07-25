@@ -181,6 +181,18 @@ def wva_target_timeseries(results_dir: Path):
     return [(int(s["timestamp"]), s.get("primary"), s.get("v2")) for s in samples]
 
 
+def hpa_desired_timeseries(results_dir: Path):
+    """Optional overlay: HPA status.desiredReplicas per variant, captured
+    directly from `kubectl get hpa` during the run (works for WVA-driven
+    and plain KEDA-EPP scenarios alike — see dump_hpa_desired_timeseries.py).
+    Returns [] if not present."""
+    p = results_dir / "metrics" / "processed" / "hpa_desired_timeseries.json"
+    if not p.is_file():
+        return []
+    samples = json.loads(p.read_text()).get("samples", [])
+    return [(int(s["timestamp"]), s.get("primary"), s.get("v2")) for s in samples]
+
+
 def wva_supply_demand_timeseries(results_dir: Path):
     """WVA-side analyzer numbers (totalSupply/Demand etc.). Returns [] if absent.
     Output rows: (ts, supply, demand, util, required, spare).
@@ -240,6 +252,11 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[i
     erows = epp_panels(epp_series)
     repls = replica_timeseries(results_dir)
     wva_targets = wva_target_timeseries(results_dir)
+    # Prefer the WVA controller's own decisions when present; otherwise fall
+    # back to the HPA's own status.desiredReplicas (works for plain KEDA-EPP
+    # scenarios with no WVA controller at all).
+    desired_targets = wva_targets or hpa_desired_timeseries(results_dir)
+    desired_label = "WVA desired" if wva_targets else "KEDA desired"
     wva_sd = wva_supply_demand_timeseries(results_dir)
     cd_est = capacity_demand_estimate(results_dir)
 
@@ -275,23 +292,23 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[i
     # 1. Replica Count (actual ready) + optional overlay of WVA target decisions
     ax = axes[0]
     title = "Replica Count"
-    if wva_targets:
-        title += " — solid: ready,  dashed: WVA desired"
+    if desired_targets:
+        title += f" — solid: ready,  dashed: {desired_label}"
     ax.set_title(title)
     if repls:
         x = [to_dt(r[0]) for r in repls]
         ax.step(x, [r[1] for r in repls], where="post", color=PRIMARY_COLOR, label="primary (ready)", linewidth=2)
         if has_v2:
             ax.step(x, [r[2] for r in repls], where="post", color=V2_COLOR, label="v2 (ready)", linewidth=2)
-    if wva_targets:
-        xt = [to_dt(t[0]) for t in wva_targets]
-        prim_t = [t[1] for t in wva_targets]
-        v2_t = [t[2] for t in wva_targets]
+    if desired_targets:
+        xt = [to_dt(t[0]) for t in desired_targets]
+        prim_t = [t[1] for t in desired_targets]
+        v2_t = [t[2] for t in desired_targets]
         ax.step(xt, prim_t, where="post", color=PRIMARY_COLOR, linestyle="--", linewidth=1.4,
-                label="primary (WVA target)", alpha=0.8)
+                label=f"primary ({desired_label})", alpha=0.8)
         if has_v2:
             ax.step(xt, v2_t, where="post", color=V2_COLOR, linestyle="--", linewidth=1.4,
-                    label="v2 (WVA target)", alpha=0.8)
+                    label=f"v2 ({desired_label})", alpha=0.8)
     ax.set_ylabel("Replicas")
     ax.legend(loc="upper left", fontsize=7)
     ax.grid(alpha=0.3)

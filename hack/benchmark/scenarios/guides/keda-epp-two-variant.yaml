@@ -1,0 +1,249 @@
+# KEDA-EPP TWO-VARIANT SCENARIO — naive KEDA-only autoscaling, no WVA
+#
+# Same topology as guides/two-variant-wva.yaml (primary TP=2 cost-shape +
+# a TP=1 variant, both in one InferencePool/EPP) but WITHOUT WVA: no cost
+# awareness, no sat-v2 optimizer. Both variants are scaled by TWO
+# ScaledObjects that read the SAME pool-wide EPP queue-depth / running-
+# requests signal (that's the only granularity EPP metrics expose — there
+# is no per-Deployment breakdown), so they scale in lockstep. This is the
+# baseline the WVA two-variant leg (guides/two-variant-wva.yaml) is
+# compared against.
+#
+# Topology:
+#
+#         +--------- Gateway -------------------------+
+#         |  HTTPRoute → InferencePool (one EPP)      |
+#         +--------------------------------------------+
+#                              |
+#               +--------------+--------------+
+#               |                             |
+#     +---------+--------+       +------------+-----+
+#     | vLLM decode      |       | vLLM decode      |
+#     | primary (TP=2)   |       | variant  (TP=1)  |
+#     | ScaledObject     |       | ScaledObject     |
+#     +------------------+       +------------------+
+#                   ^                       ^
+#                   +---- same EPP signal --+
+#          (sum(inference_extension_flow_control_queue_size),
+#           sum(inference_objective_running_requests), both model-scoped)
+#
+# Usage:
+#
+#   # Step 1: stand up primary variant (no WVA installed)
+#   make benchmark-standup BENCHMARK_NAMESPACE=<ns> BENCHMARK_SPEC=guides/keda-epp-two-variant
+#
+#   # Step 2: add the TP=1 variant Deployment (its auto-created
+#   # wva_desired_replicas-triggered ScaledObjects are unused here since
+#   # there's no WVA controller running — they're overwritten in step 3)
+#   make benchmark-add-variant BENCHMARK_NAMESPACE=<ns>
+#
+#   # Step 3: replace both ScaledObjects with the EPP-driven pair
+#   kubectl delete scaledobject -n <ns> --all
+#   kubectl apply -f hack/benchmark/scenarios/keda-epp/scaledobject-two-variant-t50.yaml -n <ns>
+#
+#   # Run the benchmark
+#   make benchmark-run BENCHMARK_NAMESPACE=<ns> BENCHMARK_SPEC=guides/keda-epp-two-variant \
+#     BENCHMARK_HARNESS=inference-perf BENCHMARK_WORKLOAD=prefill_heavy_4k1k_2_10.yaml
+#
+#   # Teardown
+#   make benchmark-teardown BENCHMARK_NAMESPACE=<ns> BENCHMARK_SPEC=guides/keda-epp-two-variant
+
+# ============================================================================
+# SHARED — applied to the stack before per-stack overrides
+# ============================================================================
+shared:
+  # --------------------------------------------------------------------------
+  # DEPLOYMENT METHOD
+  # --------------------------------------------------------------------------
+  modelservice:
+    enabled: true
+  standalone:
+    enabled: false
+
+  # --------------------------------------------------------------------------
+  # IMAGE OVERRIDES — pin vllm-openai to v0.14.0 for consistency with the
+  # WVA two-variant leg (not required for KEDA-EPP itself, but keeps the
+  # comparison apples-to-apples).
+  # --------------------------------------------------------------------------
+  images:
+    vllmOpenai:
+      repository: docker.io/vllm/vllm-openai
+      tag: v0.14.0
+
+  # --------------------------------------------------------------------------
+  # EPP PLUGIN CONFIG — flowControl feature gate required for the
+  # inference_extension_flow_control_queue_size metric used by the KEDA
+  # ScaledObject triggers.
+  # --------------------------------------------------------------------------
+  inferenceExtension:
+    pluginsConfigFile: "keda-epp-plugins.yaml"
+    pluginsCustomConfig:
+      keda-epp-plugins.yaml: |
+        apiVersion: inference.networking.x-k8s.io/v1alpha1
+        kind: EndpointPickerConfig
+        featureGates:
+          - flowControl
+        plugins:
+          - type: queue-scorer
+          - type: kv-cache-utilization-scorer
+          - type: prefix-cache-scorer
+        schedulingProfiles:
+          - name: default
+            plugins:
+              - pluginRef: queue-scorer
+                weight: 2
+              - pluginRef: kv-cache-utilization-scorer
+                weight: 2
+              - pluginRef: prefix-cache-scorer
+                weight: 3
+
+  # --------------------------------------------------------------------------
+  # VLLM COMMON
+  # --------------------------------------------------------------------------
+  vllmCommon:
+    kvTransfer:
+      enabled: true
+      connector: NixlConnector
+      role: kv_both
+    flags:
+      enforceEager: true
+      disableLogRequests: true
+      disableUvicornAccessLog: true
+      allowLongMaxModelLen: "1"
+      serverDevMode: "1"
+    volumes:
+      - name: shared-config
+        type: emptyDir
+        emptyDir: {}
+      - name: dshm
+        type: emptyDir
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+    volumeMounts:
+      - name: dshm
+        mountPath: /dev/shm
+      - name: shared-config
+        mountPath: /shared-config
+
+  # --------------------------------------------------------------------------
+  # PREFILL / DECODE defaults — primary variant, TP=2 (2 GPU per pod),
+  # matching guides/two-variant-wva.yaml's primary shape.
+  # --------------------------------------------------------------------------
+  prefill:
+    enabled: false
+    replicas: 0
+
+  decode:
+    initContainers:
+      - name: preprocess
+        imageKey: benchmark
+        imagePullPolicy: Always
+        command: ["set_llmdbench_environment.py", "-e", "/shared-config/llmdbench_env.sh", "-i"]
+        volumeMounts:
+          - name: shared-config
+            mountPath: /shared-config
+    parallelism:
+      tensor: 2
+      data: 1
+      dataLocal: 1
+      workers: 1
+    extraEnvVars: []
+    extraContainerConfig:
+      ports:
+        - containerPort: 5557
+          protocol: TCP
+        - containerPort: 8200
+          name: metrics
+          protocol: TCP
+      securityContext:
+        capabilities:
+          add:
+            - "IPC_LOCK"
+            - "SYS_RAWIO"
+        runAsGroup: 0
+        runAsUser: 0
+      imagePullPolicy: Always
+    additionalVolumeMounts: []
+    additionalVolumes: []
+    probes:
+      startup:
+        path: /v1/models
+        failureThreshold: 60
+        initialDelaySeconds: 15
+        periodSeconds: 30
+        timeoutSeconds: 5
+      liveness:
+        path: /health
+        failureThreshold: 3
+        periodSeconds: 10
+        timeoutSeconds: 5
+      readiness:
+        path: /v1/models
+        failureThreshold: 3
+        periodSeconds: 5
+        timeoutSeconds: 2
+    monitoring:
+      podmonitor:
+        enabled: true
+        portName: metrics
+        path: /metrics
+        interval: 30s
+        labels:
+          release: llmd
+
+  workDir: "~/data/keda-epp-two-variant"
+  harness:
+    name: inference-perf
+    experimentProfile: prefill_heavy_4k1k_2_10.yaml
+    # Default harness pod memory (32Gi) OOMKilled mid-run on this workload's
+    # 1000-token mean output (see guides/two-variant-wva.yaml for details).
+    resources:
+      cpu: 16
+      memory: 64Gi
+    # Prevent the entrypoint's 3-attempt retry loop from re-running the whole
+    # workload on transient per-request errors, which would contaminate
+    # capture windows and overwrite run_metadata.yaml's timestamps.
+    extraEnvVars:
+      - name: LLMDBENCH_RUN_EXPERIMENT_HARNESS_MAX_TRIES
+        value: "1"
+
+  storage:
+    modelPvc:
+      size: 32Gi
+
+# ============================================================================
+# SCENARIO — primary variant (TP=2), no WVA
+#
+# This standup deploys the primary variant only. Run `make benchmark-add-variant`
+# afterwards to add the TP=1 variant, then swap in the EPP-driven ScaledObjects
+# (see header for the exact commands).
+# ============================================================================
+scenario:
+  - name: "llama-8b"
+
+    model:
+      name: unsloth/Meta-Llama-3.1-8B-Instruct
+      shortName: unsloth-meta-llama-3-1-8b-instruct
+      path: models/unsloth/Meta-Llama-3.1-8B-Instruct
+      huggingfaceId: unsloth/Meta-Llama-3.1-8B-Instruct
+      size: 32Gi
+      maxModelLen: 8192
+      blockSize: 64
+      gpuMemoryUtilization: 0.85
+
+    wva:
+      variantAutoscaling:
+        enabled: false
+      hpa:
+        enabled: false
+
+    decode:
+      replicas: 1
+      resources:
+        limits:
+          memory: 48Gi
+          cpu: "16"
+        requests:
+          memory: 48Gi
+          cpu: "16"

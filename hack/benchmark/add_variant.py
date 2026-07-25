@@ -352,10 +352,17 @@ def make_variant_deployment(primary, cfg, namespace):
     tmpl_labels = spec["template"]["metadata"].setdefault("labels", {})
     tmpl_labels["wva.llmd.ai/variant"] = suffix
     tmpl_labels["llm-d.ai/variant"] = sec_name
+    # Drop the primary's own discriminator: kept, this label makes the
+    # variant's selector a superset of the primary's, which trips the
+    # native HPA controller's AmbiguousSelector safety check (both
+    # HPAs' derived pod selectors would overlap) and silently blocks
+    # scaling on both variants -- root-caused 2026-07-25.
+    tmpl_labels.pop("llm-d.ai/inference-serving", None)
 
     sel = spec["selector"]["matchLabels"]
     sel["wva.llmd.ai/variant"] = suffix
     sel["llm-d.ai/variant"] = sec_name
+    sel.pop("llm-d.ai/inference-serving", None)
 
     pod_spec = spec["template"]["spec"]
     main_containers = pod_spec.setdefault("containers", [])
