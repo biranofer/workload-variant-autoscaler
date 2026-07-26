@@ -141,28 +141,45 @@ shared:
   # --------------------------------------------------------------------------
   # EPP PLUGIN CONFIG — flowControl feature gate required for WVA queue-depth
   # driven scaling signal.
+  #
+  # NOTE: the key here is `router.epp.*`, not a top-level `inferenceExtension:`
+  # block. `inferenceExtension.pluginsConfigFile`/`pluginsCustomConfig` is the
+  # naming convention llm-d-benchmark's "convert-guide" skill uses for its
+  # GUIDE input format (mirroring the upstream gateway-api-inference-extension
+  # chart's own values.yaml) -- it is NOT a key a benchmark SCENARIO file
+  # itself is templated against. The scenario schema's real key, confirmed by
+  # reading the rendered config.yaml and llm-d-benchmark's own
+  # workload/README.md ("Sweeping EPP plugins config (router.epp.pluginsConfigFile)"),
+  # is `router.epp.pluginsConfigFile`/`pluginsCustomConfig`. Using the wrong
+  # (guide-format) key here silently no-oped: it landed in the rendered
+  # config.yaml as an unused top-level `inferenceExtension:` key, while
+  # `router.epp.pluginsConfigFile` stayed at its chart default
+  # (`default-plugins.yaml`, no `featureGates: [flowControl]`) -- meaning this
+  # scenario's `flowControl` gate has never actually been enabled by this file,
+  # in any run, since this scenario was first authored -- root-caused 2026-07-26.
   # --------------------------------------------------------------------------
-  inferenceExtension:
-    pluginsConfigFile: "wva-plugins.yaml"
-    pluginsCustomConfig:
-      wva-plugins.yaml: |
-        apiVersion: inference.networking.x-k8s.io/v1alpha1
-        kind: EndpointPickerConfig
-        featureGates:
-          - flowControl
-        plugins:
-          - type: queue-scorer
-          - type: kv-cache-utilization-scorer
-          - type: prefix-cache-scorer
-        schedulingProfiles:
-          - name: default
-            plugins:
-              - pluginRef: queue-scorer
-                weight: 2
-              - pluginRef: kv-cache-utilization-scorer
-                weight: 2
-              - pluginRef: prefix-cache-scorer
-                weight: 3
+  router:
+    epp:
+      pluginsConfigFile: "wva-plugins.yaml"
+      pluginsCustomConfig:
+        wva-plugins.yaml: |
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          featureGates:
+            - flowControl
+          plugins:
+            - type: queue-scorer
+            - type: kv-cache-utilization-scorer
+            - type: prefix-cache-scorer
+          schedulingProfiles:
+            - name: default
+              plugins:
+                - pluginRef: queue-scorer
+                  weight: 2
+                - pluginRef: kv-cache-utilization-scorer
+                  weight: 2
+                - pluginRef: prefix-cache-scorer
+                  weight: 3
 
   # --------------------------------------------------------------------------
   # VLLM COMMON
