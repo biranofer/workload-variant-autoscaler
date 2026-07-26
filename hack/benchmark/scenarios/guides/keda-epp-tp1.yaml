@@ -1,78 +1,52 @@
-# WVA SAT-2 TP=1 SCENARIO — single-variant, WVA saturation-V2 autoscaling
+# KEDA-EPP TP=1 SCENARIO — single-variant, KEDA-only autoscaling
 #
 # Deploys unsloth/Meta-Llama-3.1-8B-Instruct as a single TP=1 decode
-# deployment managed by WVA with the saturation-V2 cost-aware optimizer.
+# deployment. No WVA is installed; autoscaling is handled externally by
+# a KEDA ScaledObject (apply hack/benchmark/scenarios/keda-epp/scaledobject.yaml
+# after standup).
 #
 # Topology:
 #
 #   Gateway → InferencePool (EPP with flowControl)
 #                   |
 #           vLLM decode TP=1
-#           WVA controller (Sat-2) → KEDA ScaledObject
+#           KEDA ScaledObject (applied separately)
 #
 # Usage:
 #
 #   # Deploy
-#   make benchmark-standup BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1 \
-#     BENCHMARK_SKIP_PROMETHEUS_ADAPTER=true
+#   make benchmark-standup BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/keda-epp-tp1
 #
-#   # Register primary variant with WVA and create KEDA ScaledObject
-#   make benchmark-add-variant BENCHMARK_NAMESPACE=biran
-#
-#   # Enable saturation-V2 cost-aware optimizer
-#   make benchmark-enable-v2-saturation BENCHMARK_NAMESPACE=biran
+#   # Apply KEDA ScaledObject (no WVA; scales on EPP queue + running-request metrics)
+#   kubectl apply -f hack/benchmark/scenarios/keda-epp/scaledobject.yaml
 #
 #   # Run prefill-heavy workload
-#   make benchmark-run BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1 \
+#   make benchmark-run BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/keda-epp-tp1 \
 #     BENCHMARK_HARNESS=inference-perf BENCHMARK_WORKLOAD=prefill_heavy_4k_2_6.yaml
 #
 #   # Wait for replicas to scale back to 1 (~10 min cooldown), then run decode-heavy
-#   make benchmark-run BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1 \
-#     BENCHMARK_HARNESS=inference-perf BENCHMARK_WORKLOAD=decode_heavy_1k_2_6.yaml
+#   make benchmark-run BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/keda-epp-tp1 \
+#     BENCHMARK_HARNESS=inference-perf BENCHMARK_WORKLOAD=decode_heavy_4k_2_6.yaml
 #
 #   # Teardown
-#   make benchmark-teardown BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/wva-sat2-tp1
+#   make benchmark-teardown BENCHMARK_NAMESPACE=biran BENCHMARK_SPEC=guides/keda-epp-tp1
 
 # ============================================================================
-# SHARED
+# SHARED — applied to the stack before per-stack overrides
 # ============================================================================
 shared:
+  # --------------------------------------------------------------------------
+  # DEPLOYMENT METHOD
+  # --------------------------------------------------------------------------
   modelservice:
     enabled: true
   standalone:
     enabled: false
 
   # --------------------------------------------------------------------------
-  # WVA — saturation-V2 cost-aware optimizer
-  # --------------------------------------------------------------------------
-  wva:
-    enabled: true
-    wellLitPath: inference-scheduling
-    namespace: ""
-    image:
-      repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
-      tag: nightly-d6d39be4
-    replicaCount: 1
-    controller:
-      enabled: true
-    namespaceScoped: true
-    metrics:
-      enabled: true
-      port: 8443
-      secure: true
-    prometheus:
-      baseUrl: https://thanos-querier.openshift-monitoring.svc.cluster.local
-      port: 9091
-    vllmService:
-      enabled: true
-
-  chartVersions:
-    wva: 0.8.0-rc5
-    prometheusAdapter: 5.2.0
-
-  # --------------------------------------------------------------------------
-  # IMAGE OVERRIDES — pin vllm-openai to v0.14.0 so vllm:cache_config_info
-  # is emitted (required by WVA Sat-2 for real KV capacity).
+  # IMAGE OVERRIDES — pin vllm-openai to v0.14.0 so the model server emits
+  # vllm:cache_config_info (required by WVA Sat-2 in the comparison runs;
+  # keep pinned here for consistency).
   # --------------------------------------------------------------------------
   images:
     vllmOpenai:
@@ -80,7 +54,9 @@ shared:
       tag: v0.14.0
 
   # --------------------------------------------------------------------------
-  # EPP PLUGIN CONFIG — flowControl gate required for KEDA trigger
+  # EPP PLUGIN CONFIG — flowControl feature gate required for the
+  # inference_extension_flow_control_queue_size metric used by the KEDA
+  # ScaledObject trigger.
   #
   # NOTE: key is `router.epp.*`, not a top-level `inferenceExtension:` block --
   # same wrong-key mistake as two-variant-wva.yaml, root-caused 2026-07-26.
@@ -92,9 +68,9 @@ shared:
   # --------------------------------------------------------------------------
   router:
     epp:
-      pluginsConfigFile: "wva-plugins.yaml"
+      pluginsConfigFile: "keda-epp-plugins.yaml"
       pluginsCustomConfig:
-        wva-plugins.yaml: |
+        keda-epp-plugins.yaml: |
           apiVersion: inference.networking.x-k8s.io/v1alpha1
           kind: EndpointPickerConfig
           featureGates:
@@ -207,18 +183,10 @@ shared:
         labels:
           release: llmd
 
-  workDir: "~/data/wva-sat2-tp1"
+  workDir: "~/data/keda-epp-tp1"
   harness:
     name: inference-perf
     experimentProfile: prefill_heavy_4k_2_6.yaml
-    # Prevent the entrypoint's 3-attempt retry loop from re-running the whole
-    # workload when inference-perf exits non-zero due to per-request errors.
-    # Without this, stage 1 errors (e.g. transient timeouts under load) trigger
-    # a full stage 0+stage 1 replay, which contaminates capture windows and
-    # overwrites run_metadata.yaml with the last attempt's timestamps.
-    extraEnvVars:
-      - name: LLMDBENCH_RUN_EXPERIMENT_HARNESS_MAX_TRIES
-        value: "1"
 
   storage:
     modelPvc:

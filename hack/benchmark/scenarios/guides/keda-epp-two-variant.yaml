@@ -74,28 +74,43 @@ shared:
   # EPP PLUGIN CONFIG — flowControl feature gate required for the
   # inference_extension_flow_control_queue_size metric used by the KEDA
   # ScaledObject triggers.
+  #
+  # NOTE: key is `router.epp.*`, not a top-level `inferenceExtension:` block --
+  # same wrong-key mistake as two-variant-wva.yaml, root-caused 2026-07-26.
+  # `inferenceExtension.pluginsConfigFile`/`pluginsCustomConfig` is
+  # llm-d-benchmark's GUIDE input-format naming (its "convert-guide" skill),
+  # not a key a benchmark SCENARIO file is templated against. The real key is
+  # `router.epp.pluginsConfigFile`/`pluginsCustomConfig` (confirmed against
+  # the rendered config.yaml and llm-d-benchmark's workload/README.md). Using
+  # the wrong key meant the `flowControl` gate here was never actually
+  # enabled -- so the "queue" ScaledObject trigger
+  # (sum(inference_extension_flow_control_queue_size)) has always read
+  # empty/zero; KEDA-EPP's documented scaling behavior was driven entirely by
+  # the other trigger (inference_objective_running_requests), not corrupted,
+  # just running on one working trigger instead of two.
   # --------------------------------------------------------------------------
-  inferenceExtension:
-    pluginsConfigFile: "keda-epp-plugins.yaml"
-    pluginsCustomConfig:
-      keda-epp-plugins.yaml: |
-        apiVersion: inference.networking.x-k8s.io/v1alpha1
-        kind: EndpointPickerConfig
-        featureGates:
-          - flowControl
-        plugins:
-          - type: queue-scorer
-          - type: kv-cache-utilization-scorer
-          - type: prefix-cache-scorer
-        schedulingProfiles:
-          - name: default
-            plugins:
-              - pluginRef: queue-scorer
-                weight: 2
-              - pluginRef: kv-cache-utilization-scorer
-                weight: 2
-              - pluginRef: prefix-cache-scorer
-                weight: 3
+  router:
+    epp:
+      pluginsConfigFile: "keda-epp-plugins.yaml"
+      pluginsCustomConfig:
+        keda-epp-plugins.yaml: |
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          featureGates:
+            - flowControl
+          plugins:
+            - type: queue-scorer
+            - type: kv-cache-utilization-scorer
+            - type: prefix-cache-scorer
+          schedulingProfiles:
+            - name: default
+              plugins:
+                - pluginRef: queue-scorer
+                  weight: 2
+                - pluginRef: kv-cache-utilization-scorer
+                  weight: 2
+                - pluginRef: prefix-cache-scorer
+                  weight: 3
 
   # --------------------------------------------------------------------------
   # VLLM COMMON
