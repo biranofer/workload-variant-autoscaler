@@ -643,7 +643,15 @@ def main():
             model_id = hpa_ann.get("llm-d.ai/model-id") or detect_model_id(primary_dep)
             primary_cost = hpa_ann.get("llm-d.ai/variant-cost", "10.0")
             primary_min = legacy_hpa.get("spec", {}).get("minReplicas", 1)
-            primary_max = legacy_hpa.get("spec", {}).get("maxReplicas", 10)
+            # Fixed at 10, matching the variant's explicit maxReplicas: 10 --
+            # NOT inherited from the legacy HPA. The modelservice chart
+            # computes its own default maxReplicas for the auto-generated
+            # legacy HPA (observed 16 on one standup, 10 on others, from
+            # chart-internal GPU/budget heuristics we don't control) -- for a
+            # reproducible benchmark comparison this must be a fixed,
+            # benchmark-controlled parameter, not an accidental artifact of
+            # chart internals -- root-caused 2026-07-26.
+            primary_max = 10
             print(f"      Found legacy direct HPA '{legacy_hpa['metadata']['name']}' "
                   f"(model-id={model_id}, cost={primary_cost}) — converting to ScaledObject")
         else:
