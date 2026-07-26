@@ -96,6 +96,33 @@ def kubectl_delete(kind, name, namespace, dry_run=False):
     kubectl("delete", kind, name, "-n", namespace, "--ignore-not-found=true")
 
 
+def fix_variant_pod_label(dep_name, namespace, correct_value, dry_run=False):
+    """Patch a Deployment's pod template `llm-d.ai/variant` label to
+    `correct_value` if it doesn't already match. WVA's collector trusts this
+    label as-is whenever it's present (see make_variant_deployment's comment)
+    -- a wrong value silently drops that pod's demand contribution rather
+    than erroring, so scenario-yaml-hardcoded or stale values on the primary
+    Deployment need the same correction the variant gets at creation time.
+    Only patches spec.template.metadata.labels (safe: not part of the
+    Deployment's immutable spec.selector), so no immutable-field conflict.
+    """
+    current = kubectl("get", "deployment", dep_name, "-n", namespace,
+                       "-o", "jsonpath={.spec.template.metadata.labels.llm-d\\.ai/variant}",
+                       check=False).strip()
+    if current == correct_value:
+        return
+    print(f"      Correcting {dep_name}'s llm-d.ai/variant label: "
+          f"{current!r} -> {correct_value!r}")
+    if dry_run:
+        print(f"[dry-run] kubectl patch deployment {dep_name} -n {namespace} "
+              f"--type=merge -p ...llm-d.ai/variant={correct_value}")
+        return
+    patch = json.dumps({
+        "spec": {"template": {"metadata": {"labels": {"llm-d.ai/variant": correct_value}}}}
+    })
+    kubectl("patch", "deployment", dep_name, "-n", namespace, "--type=merge", "-p", patch)
+
+
 def _strip_managed(obj):
     """Remove server-managed fields before re-applying as a new object."""
     meta = obj.setdefault("metadata", {})
@@ -349,9 +376,20 @@ def make_variant_deployment(primary, cfg, namespace):
     spec = sec["spec"]
     spec["replicas"] = 1
 
+    # WVA's collector (buildInstanceKey in internal/collector/replica_metrics.go)
+    # trusts this label as the pod's VariantAutoscaling name whenever it's
+    # non-empty -- it only falls back to the correct owner-chain lookup when
+    # the label is *missing*, not when it's wrong. The tracked VA/ScaledObject
+    # is always named "<deployment>-scaler", so the label must match that
+    # exactly or every pod's metrics (including the queue-backlog demand term)
+    # get silently filed under an unattributed variant and dropped from the
+    # analyzer's totalDemand -- root-caused 2026-07-25/26 (see
+    # UnattributedReadyPods warnings in the controller log).
+    variant_label = f"{sec_name}-scaler"
+
     tmpl_labels = spec["template"]["metadata"].setdefault("labels", {})
     tmpl_labels["wva.llmd.ai/variant"] = suffix
-    tmpl_labels["llm-d.ai/variant"] = sec_name
+    tmpl_labels["llm-d.ai/variant"] = variant_label
     # Drop the primary's own discriminator: kept, this label makes the
     # variant's selector a superset of the primary's, which trips the
     # native HPA controller's AmbiguousSelector safety check (both
@@ -361,7 +399,7 @@ def make_variant_deployment(primary, cfg, namespace):
 
     sel = spec["selector"]["matchLabels"]
     sel["wva.llmd.ai/variant"] = suffix
-    sel["llm-d.ai/variant"] = sec_name
+    sel["llm-d.ai/variant"] = variant_label
     sel.pop("llm-d.ai/inference-serving", None)
 
     pod_spec = spec["template"]["spec"]
@@ -581,7 +619,21 @@ def main():
 
     print(f"[3/4] Resolving primary ScaledObject...")
     primary_so = find_managed_scaledobject(ns, dep_name)
-    primary_so_name = f"{dep_name}-scaler"
+
+    # The modelservice chart unconditionally stamps llm-d.ai/variant=<model_id_label>-decode
+    # on primary's pod template (13_ms-values.yaml.j2, gated only on wva.enabled) whenever
+    # WVA is enabled -- independent of any scenario-yaml override. That value is baked into
+    # the Deployment's *selector* too (selector must be a subset of template labels), so it
+    # is immutable once created. Rather than fight an upstream chart default we can't
+    # durably patch, align the ScaledObject's own name to whatever the chart already put
+    # there (read live, not assumed) so WVA's collector attributes primary's metrics
+    # correctly without touching the Deployment at all -- root-caused 2026-07-25/26.
+    existing_variant_label = kubectl(
+        "get", "deployment", dep_name, "-n", ns,
+        "-o", "jsonpath={.spec.template.metadata.labels.llm-d\\.ai/variant}",
+        check=False,
+    ).strip()
+    primary_so_name = existing_variant_label or f"{dep_name}-scaler"
 
     if primary_so is None:
         # First run: check for legacy direct HPA left by the benchmark harness
@@ -628,6 +680,8 @@ def main():
         primary_cost = ann.get("llm-d.ai/variant-cost", "10.0")
         primary_so_name = primary_so["metadata"]["name"]
         print(f"      {primary_so_name}  (model-id={model_id}, cost={primary_cost})")
+
+    fix_variant_pod_label(dep_name, ns, primary_so_name, dry_run=args.dry_run)
 
     print(f"[4/4] Creating variant '{suffix}'  "
           f"variantCost={cfg['variantCost']}  modelID={model_id}")

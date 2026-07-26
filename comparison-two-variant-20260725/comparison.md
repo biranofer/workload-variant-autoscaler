@@ -39,16 +39,25 @@ Both share the same KEDA HPA scaleUp/scaleDown behavior: Percent=100/15s, ScaleU
 
 **Workload** (`prefill_heavy_4k1k_2_10`, Poisson arrival): input ≈4000 tokens, output ≈1000 tokens, 5 min @ rate=2 (warm-up) then 12 min @ rate=10 (saturation). 7800 requests total.
 
-## Prerequisite bug fixes — without these, replicas never leave 1
+## Prerequisite bug fixes — without these, the results are not trustworthy
 
-Getting a valid run took fixing two independent, compounding bugs. Both produced the identical "stuck at 1 replica" symptom while the WVA controller's own decision log looked completely healthy (correctly computing scale-up decisions that never reached the cluster) — a reminder that a controller's decision log is not proof its decisions were applied.
+Getting a *believable* run took fixing four independent, compounding bugs, discovered in two rounds. All of them produced plausible-looking symptoms while the WVA controller's own decision log looked completely healthy — a reminder that a controller's decision log is not proof its decisions were applied, or that its inputs were correct.
 
-1. **`add_variant.py`'s variant Deployment selector was a superset of the primary's** — inherited (never removed) the primary's `llm-d.ai/inference-serving` discriminator label, so Kubernetes' native HPA controller's `AmbiguousSelector` safety check fired for both HPAs and blocked scaling entirely. Fixed in `hack/benchmark/add_variant.py::make_variant_deployment()` (this session, committed to this repo).
+**Round 1 — replicas never left 1 at all:**
+1. **`add_variant.py`'s variant Deployment selector was a superset of the primary's** — inherited (never removed) the primary's `llm-d.ai/inference-serving` discriminator label, so Kubernetes' native HPA controller's `AmbiguousSelector` safety check fired for both HPAs and blocked scaling entirely. Fixed in `hack/benchmark/add_variant.py::make_variant_deployment()`.
 2. **The WVA controller's `ServiceMonitor` has a hardcoded TLS `serverName`** (`wva-controller-manager-metrics-service.wva-system.svc`) that doesn't match the real tenant namespace, silently breaking the HTTPS scrape — `wva_desired_replicas` never reaches Prometheus, so KEDA's HPA always reads empty and never scales. This resets on every fresh `benchmark-standup` and is not yet fixed at the template level; requires a manual patch after every standup:
   ```
   oc patch servicemonitor wva-controller-manager-metrics-monitor -n <ns> --type=json \
     -p '[{"op":"replace","path":"/spec/endpoints/0/tlsConfig/serverName","value":"wva-controller-manager-metrics-service.<ns>.svc"}]'
   ```
+
+**Round 2 — replicas scaled, but the demand estimate feeding that decision was silently wrong by ~2×.** Even after fixing (1) and (2), WVA's self-reported `totalDemand` ran at roughly half an independent raw-scrape estimate of the same quantity (computed by `dump_capacity_demand_estimate.py` directly from vLLM/EPP Prometheus scrapes, with no dependency on WVA's own attribution). Root cause: WVA's collector (`buildInstanceKey` in `internal/collector/replica_metrics.go`) trusts a pod's `llm-d.ai/variant` label as-is whenever it's *present* — it only falls back to the correct owner-chain-based lookup when the label is *missing*. Two places set this label to the wrong value (present, but wrong — the exact case that bypasses the safe fallback):
+3. **The added variant's own label**, set by `add_variant.py` itself, to the bare Deployment name instead of the tracked ScaledObject's name (`<deployment>-scaler`). Fixed in `make_variant_deployment()`.
+4. **Primary's label**, set unconditionally by the `llm-d-benchmark` modelservice chart template (`13_ms-values.yaml.j2`, gated only on `wva.enabled`) to `<model_id_label>-decode` — which is baked into the Deployment's *selector* too (selector must be a subset of template labels), making it immutable once created. Rather than fight an upstream chart default we can't durably patch, `add_variant.py` now reads primary's live label and **names the primary ScaledObject to match it**, instead of assuming a fixed `<deployment>-scaler` pattern — no Deployment edit needed at all.
+
+Verified fixed: cross-checking WVA's `totalDemand` against the independent raw estimate sample-by-sample after both fixes shows the ratio sitting at ~0.9–1.3 throughout the run (vs. a consistent ~0.5 before) — matching within normal sampling noise instead of systematically undercounting.
+
+**A live labeling bug this deep and this old (present since the KEDA migration, `#1435`) went undetected until now because the only prior check anyone did was "does it still scale at all" — which passes even with this bug, since the in-use-KV component of demand is attributed through a different, unaffected path. Only the queue-backlog component silently dropped.** Confirmed this is scoped to the two-variant path specifically: all 10 result directories behind [`comparison-wva-keda-epp-20260722`](../comparison-wva-keda-epp-20260722/comparison.md)'s single-variant comparison carry *no* `llm_d_ai_variant` label on any pod at all (label absent → correct fallback path), so that doc's numbers are unaffected.
 
 Also fixed along the way (not scaling-correctness bugs, but distort results if left alone): the harness pod's default 32Gi memory OOMKilled mid-run on this workload's 1000-token mean output (bumped to 64Gi in both scenario files), and `report.request_lifecycle.per_request: true` generated a multi-GB JSON file (observed 6GB+, 45+ minutes to collect) that nothing in the analysis pipeline reads — disabled in the workload file.
 
@@ -57,42 +66,44 @@ Also fixed along the way (not scaling-correctness bugs, but distort results if l
 | metric                                |       WVA | KEDA-EPP   |
 |---------------------------------------|-----------|------------|
 | requests                              |      7800 | 7800       |
-| successful                            |      7800 | 7767       |
-| errors                                |     **0** | 33         |
-| error rate                            | **0.00%** | 0.42%      |
-| achieved RPS                          |      7.24 | 7.48       |
-| avg replicas (primary)                |  **1.00** | 5.58       |
-| avg replicas (variant)                |  **1.42** | 5.60       |
-| max replicas (primary)                |     **1** | 10         |
-| max replicas (variant)                |     **2** | 10         |
-| cost (weighted avg replicas × GPU/hr) |  **3.42** | 16.75      |
-| avg KV cache utilization              |     59.7% | ~10%       |
-| TTFT p50 (ms)                         |    31,055 | **132**    |
-| TTFT p95 (ms)                         |    75,152 | **1,192**  |
-| TTFT p99 (ms)                         |   110,988 | **5,398**  |
-| Request latency p50 (ms)              |    68,885 | **12,227** |
-| Request latency p95 (ms)              |   109,562 | **16,511** |
-| Request latency p99 (ms)              |   146,295 | **20,100** |
-| TPOT p50 (ms)                         |  **36.7** | 12.5       |
-| TPOT p95 (ms)                         |  **49.9** | 17.8       |
-| TPOT p99 (ms)                         |  **80.5** | 30.1       |
+| successful                            |      7696 | 7767       |
+| errors                                |       104 | **33**     |
+| error rate                            |     1.33% | **0.42%** |
+| achieved RPS                          |      7.14 | 7.48       |
+| avg replicas (primary)                |  **1.68** | 5.58       |
+| avg replicas (variant)                |  **1.00** | 5.60       |
+| max replicas (primary)                |     **5** | 10         |
+| max replicas (variant)                |     **1** | 10         |
+| cost (weighted avg replicas × GPU/hr) |  **4.36** | 16.75      |
+| avg KV cache utilization              |     21.3% | ~10%       |
+| TTFT p50 (ms)                         |       211 | **132**    |
+| TTFT p95 (ms)                         |    23,620 | **1,192**  |
+| TTFT p99 (ms)                         |    35,968 | **5,398**  |
+| Request latency p50 (ms)              |    22,903 | **12,227** |
+| Request latency p95 (ms)              |    58,668 | **16,511** |
+| Request latency p99 (ms)              |    66,546 | **20,100** |
+| TPOT p50 (ms)                         |      24.1 | **12.5**   |
+| TPOT p95 (ms)                         |      40.0 | **17.8**   |
+| TPOT p99 (ms)                         |      73.8 | **30.1**   |
 
 Reproducing:
 
 | run      | results dir                                                             |
 |----------|-------------------------------------------------------------------------|
-| WVA      | `biran-20260725-175238-930/results/inference-perf-1784991200-atn1rw_1/` |
+| WVA      | `biran-20260726-090128-217/results/inference-perf-1785045730-70k1js_1/` |
 | KEDA-EPP | `biran-20260725-163818-109/results/inference-perf-1784986741-1ckph5_1/` |
 
 ## Graphs
 
 Full per-run pipeline plots (replica count with desired/ready overlay, estimated demand vs capacity, KV utilization, requests running/waiting, EPP queue depth — all vs time):
 
-### WVA — primary flat at 1, variant steps 1→2 under peak load
+### WVA — primary scales (1→5), variant stays flat at 1
 
 ![WVA two-variant pipeline](img/wva_pipeline.png)
 
-Primary (TP=2, the more cost-efficient variant per the pricing above) never leaves 1 replica — KV utilization stays under WVA's 85% scale-up threshold for primary throughout. The cheaper variant (TP=1) absorbs the overflow, stepping 1→2 during the rate=10 stage and back to 1 as load recedes. This is the "spill to the cheaper variant only when primary saturates" behavior — but note primary itself never actually saturates here (its own KV util panel would need to be read alongside `v2`'s to fully confirm which one WVA judged closer to threshold; see the raw data for the full breakdown).
+With both label-attribution bugs fixed, WVA now does what the cost-aware pricing predicts: **primary (TP=2, the more GPU-efficient variant per unit cost) is the one that scales**, climbing to 5 replicas under load while the variant (TP=1) never leaves 1. This is the opposite of every earlier (buggy) run of this scenario, where the variant scaled and primary never did.
+
+The replica-count panel also shows a clear **oscillation**: two distinct load humps rather than one steady ramp, with WVA's own desired-target line (dashed) swinging 1→3→4→5→2→1→3→4 rather than settling. This matches the failure mode already documented in the single-variant comparison (honest-conclusions #4): once new pods come online, WVA's demand estimate drops sharply (added capacity outpaces the now-lower relative pressure), triggering a scale-down that then lets the queue rebuild, triggering another scale-up. The 104 errors in this run cluster at 31–45s request latency — well under the 300s client timeout — consistent with that same pattern's signature (in-flight streams severed by pod termination during a scale-down), not client-side timeouts.
 
 ### KEDA-EPP — both variants scale in lockstep (no cost-awareness)
 
@@ -102,17 +113,17 @@ Both ScaledObjects read the identical pool-wide EPP signal, so primary and varia
 
 ## Reading these numbers
 
-**Cost**: WVA holds the line at ~2.4 total replicas (1 primary + 1.4 variant) for the entire run, vs KEDA-EPP's ~11.2 total (5.6 + 5.6) — **a 5× cost difference**, achieved with **zero errors** vs KEDA-EPP's 0.42%.
+**Cost**: WVA holds the line at ~2.7 total replicas (1.68 primary + 1.0 variant) for the entire run, vs KEDA-EPP's ~11.2 total (5.6 + 5.6) — **a ~4× cost difference**.
 
-**Latency**: the flip side is stark — WVA's p50 TTFT (31s) is roughly 235× KEDA-EPP's (0.13s), and request latency is ~5.6× worse at every percentile. This tracks directly from replica count: 3 GPUs total (WVA) vs ~17 GPUs total (KEDA-EPP, at ~5.6+5.6 replicas × mixed TP) serving the same 4000-token-prompt, up-to-10-RPS load.
+**WVA correctly prioritizes the more efficient variant**, for the first time across every run of this scenario (buggy or not): primary (TP=2, the better cost-per-GPU pick given cost ratio 10/5 = TP ratio 2/1) is the one that scales, up to 5 replicas; the variant (TP=1) never leaves 1. This is the theoretically-expected cost-aware behavior that no prior run — including the ones behind PR #1435's own validation numbers — ever actually demonstrated, because the demand-attribution bug made the controller's inputs unreliable.
 
-**Is this a fair test of WVA's value proposition?** Partially. It correctly demonstrates the *cost* side of the story — WVA held cost 5× lower with better reliability by staying under its saturation threshold. But the *latency* side looks worse for WVA than the single-variant comparison's honest-conclusions #4 already predicted: WVA's conservative 85%/70% thresholds mean it tolerates far more queueing before scaling than KEDA-EPP's much more reactive queue/running-request triggers. This workload (4000-token prompts, up to 10 RPS, only 3 GPUs worth of ceiling reached) pushes both variants into sustained near-saturation, which is exactly the regime the single-variant comparison already flagged as WVA's weak spot (see that doc's honest-conclusions #4).
+**Reliability and latency both got worse for WVA relative to the (invalid) earlier version of this run** — not because the earlier numbers were "better," but because they were an artifact of WVA barely scaling at all on corrupted, undercounted demand. With correct demand, WVA now scales for real, discovers a genuine **scale-up/scale-down oscillation** (see graph commentary above), and that oscillation is what produces the 104 errors (1.33%) and the wide latency spread (TTFT p50 close to KEDA-EPP's — 211ms vs 132ms — but p95/p99 20-6.7× worse, driven by the two congestion humps). KEDA-EPP wins on every latency percentile and on error rate.
 
-**What this run does *not* yet show**: primary (the more cost-efficient variant per the stated pricing) never scaled beyond 1, so this run doesn't demonstrate WVA's cost-aware solver actually *choosing* between two saturating variants — only "hold the cheap one, spill overflow to the cheaper one." A workload that pushes primary itself past its threshold (higher rate, or a lower primary max-replica ceiling to force contention) would be a sharper test of the cost-aware prioritization logic specifically.
+**Is this a fair test of WVA's value proposition?** More so than before, but still not the sharpest version of it. It now genuinely demonstrates cost-aware *prioritization* (primary over variant) for the first time, at ~4× lower cost than the naive baseline. But the oscillation is a *different*, already-documented weakness (mid-run scale-down killing in-flight streams, single-variant comparison honest-conclusions #4) showing up in the two-variant setting too — it's not specific to having two variants, and it's largely why WVA's latency numbers look worse here than a "pure" cost-aware win would.
 
 ## Honest conclusions
 
-1. **The cost story is real and large**: 5× cheaper, zero errors, at the price of much higher latency under this specific (GPU-constrained, 3-total-GPU) setup.
-2. **This is not yet the cost-aware-*prioritization* test** — primary held at 1 the whole run, so we saw "hold cheap, spill to cheaper" rather than a genuine primary-vs-variant efficiency tradeoff under contention.
-3. **The bugs mattered more than the workload choice.** Two independent, silent scaling-blocking bugs (documented above) mean any *prior* two-variant WVA results in this codebase (including PR #1435's own validation numbers) should be re-verified against real replica counts before being trusted at face value.
-4. **Next natural step**: rerun at a higher rate or with primary's own max-replicas capped low enough to force it past its 85% threshold, to see whether WVA's cost-aware solver actually prioritizes the efficient variant once both are under real pressure — that's the scenario this run didn't reach.
+1. **The cost-aware prioritization story is now real**, not just theoretical: primary (the GPU-efficient variant) scales, the cheaper-but-less-efficient variant doesn't — at ~4× lower cost than the naive KEDA-EPP baseline.
+2. **The reliability/latency numbers are worse than the (invalid) first pass of this run reported** — that's expected and correct: the earlier numbers looked better only because a demand-undercounting bug kept WVA from scaling at all. This run's errors and latency spread are a real finding (the scale-up/scale-down oscillation), not a regression from fixing the bugs.
+3. **Two rounds of bugs, four fixes total, were needed to get here** (see "Prerequisite bug fixes" above). Any *prior* two-variant WVA results in this codebase — including PR #1435's own validation numbers — should be re-verified against real replica counts and, ideally, an independent demand cross-check before being trusted at face value.
+4. **The oscillation, not the cost-aware logic, is now the main open question.** It's the same pattern already flagged in the single-variant comparison (mid-run scale-down severing in-flight streams) — worth the same tuning follow-ups suggested there (raise `scaleDownBoundary`, add scale-up hysteresis) rather than a two-variant-specific fix.
