@@ -109,18 +109,19 @@ shared:
     vllmService:
       enabled: true
 
-  # Tag every scrape target with its variant name so the WVA collector can
-  # directly map metric rows to variants. add_variant.py overrides this label
-  # on each added variant Deployment to its own deployment name.
-  modelArtifacts:
-    extraLabels:
-      # NOTE: this is a model-derived value (the literal = <model_id_label>-decode
-      # for the default model above). It is NOT consumed by the saturation-V2
-      # collector (verified: a run with a different -m carried this stale value
-      # and V2 still mapped/scaled correctly), so it is metadata only. Keep it in
-      # sync with the default model, or template/drop it when the scenario config
-      # gains jinja support.
-      "llm-d.ai/variant": "unsloth--6b24a594-instruct-decode"
+  # NOTE: deliberately NOT setting modelArtifacts.extraLabels["llm-d.ai/variant"]
+  # here. WVA's collector (buildInstanceKey in internal/collector/replica_metrics.go)
+  # trusts this label as the pod's VariantAutoscaling name whenever it's
+  # present -- it only falls back to the correct owner-chain lookup when the
+  # label is *missing*. The correct value depends on the runtime-resolved
+  # ScaledObject name ("<deployment>-scaler"), which isn't knowable at scenario-
+  # render time (and is model-hash-dependent), so a hardcoded value here would
+  # almost certainly be wrong and would silently drop this pod's demand
+  # contribution from the analyzer -- root-caused 2026-07-25/26 (a previous
+  # hardcoded value here was believed harmless/"metadata only" but wasn't).
+  # Leaving the label unset lets `make benchmark-add-variant`
+  # (add_variant.py's fix_variant_pod_label()) set it correctly post-standup,
+  # once the primary ScaledObject's real name is known.
 
   chartVersions:
     wva: 0.8.0-rc5
