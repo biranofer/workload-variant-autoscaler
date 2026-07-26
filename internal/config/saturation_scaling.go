@@ -60,6 +60,17 @@ type SaturationScalingConfig struct {
 	// When empty and AnalyzerName is "saturation", defaults to
 	// [{Name: "saturation", Score: 1.0, Enabled: true}].
 	Analyzers []AnalyzerScoreConfig `yaml:"analyzers,omitempty"`
+
+	// EPPQueueDemandMultiplier scales the token demand the V2 analyzer
+	// estimates from EPP's scheduler queue (requests queued upstream in
+	// llm-d flow control, before reaching any replica) before folding it
+	// into model-level demand. Values > 1.0 bias the autoscaler toward
+	// earlier scale-up under upstream queue pressure; values in (0, 1.0)
+	// de-emphasize it. The same factor also scales how sharply that
+	// contribution collapses once the queue drains, so a higher value is
+	// not a pure win — it can amplify a scale-down overcorrection as well.
+	// Default: 1.0 (no-op, matches pre-existing behavior).
+	EPPQueueDemandMultiplier float64 `yaml:"eppQueueDemandMultiplier,omitempty"`
 }
 
 // AnalyzerScoreConfig configures an individual analyzer's weight in the
@@ -122,6 +133,11 @@ const (
 	DefaultScaleDownBoundary = 0.70
 )
 
+// DefaultEPPQueueDemandMultiplier is the no-op value for EPPQueueDemandMultiplier.
+// Defined here (rather than reusing saturation_v2's constant of the same name)
+// to avoid an import cycle: saturation_v2 already imports this package.
+const DefaultEPPQueueDemandMultiplier = 1.0
+
 // ApplyDefaults fills in zero-valued fields with their defaults.
 // V1 thresholds (KvCacheThreshold, QueueLengthThreshold, KvSpareTrigger, QueueSpareTrigger)
 // are always defaulted when zero. V2 thresholds (ScaleUpThreshold, ScaleDownBoundary) and
@@ -155,6 +171,9 @@ func (c *SaturationScalingConfig) ApplyDefaults() {
 		if c.ScaleDownBoundary == 0 {
 			c.ScaleDownBoundary = DefaultScaleDownBoundary
 		}
+		if c.EPPQueueDemandMultiplier == 0 {
+			c.EPPQueueDemandMultiplier = DefaultEPPQueueDemandMultiplier
+		}
 		// Default analyzers list when empty (backward compat for analyzerName: "saturation")
 		if len(c.Analyzers) == 0 {
 			enabled := true
@@ -176,18 +195,21 @@ func (c *SaturationScalingConfig) ApplyDefaults() {
 }
 
 // ApplyV2ThresholdDefaults fills zero-valued V2 thresholds (ScaleUpThreshold,
-// ScaleDownBoundary) with their defaults regardless of IsV2(). Call this only on a
-// FINAL resolved config (after base + override Merge), never on an individual stored
-// entry: analyzer selection is global, so a V1-style per-model/namespace entry may run
-// on the V2 path and must be calibrated — but defaulting these fields on the stored
-// entry would clobber a tuned global threshold during Merge(). Inert on the V1 path,
-// which never reads these fields.
+// ScaleDownBoundary, EPPQueueDemandMultiplier) with their defaults regardless of
+// IsV2(). Call this only on a FINAL resolved config (after base + override Merge),
+// never on an individual stored entry: analyzer selection is global, so a V1-style
+// per-model/namespace entry may run on the V2 path and must be calibrated — but
+// defaulting these fields on the stored entry would clobber a tuned global value
+// during Merge(). Inert on the V1 path, which never reads these fields.
 func (c *SaturationScalingConfig) ApplyV2ThresholdDefaults() {
 	if c.ScaleUpThreshold == 0 {
 		c.ScaleUpThreshold = DefaultScaleUpThreshold
 	}
 	if c.ScaleDownBoundary == 0 {
 		c.ScaleDownBoundary = DefaultScaleDownBoundary
+	}
+	if c.EPPQueueDemandMultiplier == 0 {
+		c.EPPQueueDemandMultiplier = DefaultEPPQueueDemandMultiplier
 	}
 }
 
@@ -215,6 +237,9 @@ func (c *SaturationScalingConfig) Merge(override SaturationScalingConfig) {
 	}
 	if override.ScaleDownBoundary != 0 {
 		c.ScaleDownBoundary = override.ScaleDownBoundary
+	}
+	if override.EPPQueueDemandMultiplier != 0 {
+		c.EPPQueueDemandMultiplier = override.EPPQueueDemandMultiplier
 	}
 	if override.EnableLimiter {
 		c.EnableLimiter = override.EnableLimiter
@@ -251,6 +276,11 @@ func (c *SaturationScalingConfig) Validate() error {
 	}
 	if c.Priority < 0 {
 		return fmt.Errorf("priority must be >= 0, got %.2f", c.Priority)
+	}
+	// Zero means "unset" (defaulted elsewhere); only reject an explicit
+	// negative or zero value that survived ApplyDefaults() unexpectedly.
+	if c.EPPQueueDemandMultiplier < 0 {
+		return fmt.Errorf("eppQueueDemandMultiplier must be >= 0, got %.2f", c.EPPQueueDemandMultiplier)
 	}
 
 	// KV cache threshold should be greater than spare trigger (otherwise contradictory)

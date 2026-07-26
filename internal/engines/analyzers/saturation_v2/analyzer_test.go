@@ -799,11 +799,12 @@ var _ = Describe("SaturationAnalyzer", func() {
 					{VariantName: "decode-v", CurrentReplicas: 1, GPUsPerReplica: 1, Role: "decode"},
 				},
 				Config: &config.SaturationScalingConfig{
-					KvCacheThreshold:     0.8,
-					QueueLengthThreshold: 5,
-					AnalyzerName:         "saturation",
-					ScaleUpThreshold:     0.85,
-					ScaleDownBoundary:    0.70,
+					KvCacheThreshold:         0.8,
+					QueueLengthThreshold:     5,
+					AnalyzerName:             "saturation",
+					ScaleUpThreshold:         0.85,
+					ScaleDownBoundary:        0.70,
+					EPPQueueDemandMultiplier: 1.0,
 				},
 				SchedulerQueue: &domain.SchedulerQueueMetrics{
 					QueueSize:  10,
@@ -862,13 +863,14 @@ func makeAnalyzerInput(
 	states []domain.VariantReplicaState,
 ) domain.AnalyzerInput {
 	config := &config.SaturationScalingConfig{
-		KvCacheThreshold:     0.8,
-		QueueLengthThreshold: 5,
-		KvSpareTrigger:       0.1,
-		QueueSpareTrigger:    3,
-		AnalyzerName:         "saturation",
-		ScaleUpThreshold:     0.85,
-		ScaleDownBoundary:    0.70,
+		KvCacheThreshold:         0.8,
+		QueueLengthThreshold:     5,
+		KvSpareTrigger:           0.1,
+		QueueSpareTrigger:        3,
+		AnalyzerName:             "saturation",
+		ScaleUpThreshold:         0.85,
+		ScaleDownBoundary:        0.70,
+		EPPQueueDemandMultiplier: 1.0,
 	}
 	return domain.AnalyzerInput{
 		ModelID:        "test-model",

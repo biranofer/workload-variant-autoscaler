@@ -306,6 +306,31 @@ var _ = Describe("SaturationScalingConfig", func() {
 			Expect(config.Priority).To(Equal(5.0))
 		})
 
+		It("should apply default EPPQueueDemandMultiplier when zero (V2 config)", func() {
+			config := SaturationScalingConfig{
+				AnalyzerName: "saturation",
+			}
+			config.ApplyDefaults()
+			Expect(config.EPPQueueDemandMultiplier).To(Equal(DefaultEPPQueueDemandMultiplier))
+		})
+
+		It("should not overwrite explicit EPPQueueDemandMultiplier", func() {
+			config := SaturationScalingConfig{
+				AnalyzerName:             "saturation",
+				EPPQueueDemandMultiplier: 2.0,
+			}
+			config.ApplyDefaults()
+			Expect(config.EPPQueueDemandMultiplier).To(Equal(2.0))
+		})
+
+		It("should keep EPPQueueDemandMultiplier zero on ApplyDefaults when not V2, then calibrate via ApplyV2ThresholdDefaults", func() {
+			config := SaturationScalingConfig{}
+			config.ApplyDefaults()
+			Expect(config.EPPQueueDemandMultiplier).To(Equal(0.0))
+			config.ApplyV2ThresholdDefaults()
+			Expect(config.EPPQueueDemandMultiplier).To(Equal(DefaultEPPQueueDemandMultiplier))
+		})
+
 		It("should not overwrite explicit analyzers", func() {
 			disabled := false
 			config := SaturationScalingConfig{
@@ -417,6 +442,18 @@ var _ = Describe("SaturationScalingConfig", func() {
 			Expect(base.ScaleUpThreshold).To(Equal(0.90))
 			Expect(base.ScaleDownBoundary).To(Equal(0.70))
 			Expect(base.AnalyzerName).To(Equal("saturation"))
+		})
+
+		It("should overlay EPPQueueDemandMultiplier", func() {
+			base := SaturationScalingConfig{
+				AnalyzerName:             "saturation",
+				EPPQueueDemandMultiplier: 1.0,
+			}
+			override := SaturationScalingConfig{
+				EPPQueueDemandMultiplier: 2.0,
+			}
+			base.Merge(override)
+			Expect(base.EPPQueueDemandMultiplier).To(Equal(2.0))
 		})
 
 		It("should overlay analyzers list", func() {

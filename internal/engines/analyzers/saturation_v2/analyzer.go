@@ -105,9 +105,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	}
 
 	// Add scheduler queue demand (requests queued upstream in llm-d flow control).
-	// The EPP queue demand multiplier is an internal knob for now; a follow-up
-	// will source it from satConfig.
-	queueDemand := estimateSchedulerQueueDemand(input.SchedulerQueue, input.ReplicaMetrics, activeRoles, DefaultEPPQueueDemandMultiplier)
+	queueDemand := estimateSchedulerQueueDemand(input.SchedulerQueue, input.ReplicaMetrics, activeRoles, satConfig.EPPQueueDemandMultiplier)
 	totalDemand += queueDemand.total
 
 	var utilization float64
