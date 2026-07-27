@@ -40,11 +40,35 @@ echo "[5/6] dump_hpa_desired_timeseries.py (HPA status.desiredReplicas — works
 python3 "$SCRIPT_DIR/dump_hpa_desired_timeseries.py" "$RESULTS_DIR" || true
 
 echo "[6/6] plot_two_variant_pipeline.py"
+# Stage-transition lines: cumulative offsets (seconds from run start) computed
+# from each stage_N_lifecycle_metrics.json's own measured benchmark_time_seconds
+# (not the workload's nominal duration — actual elapsed time drifts a little).
+# Only meaningful for multi-stage workloads; skipped for single-stage runs.
+STAGE_SEC="$(python3 -c "
+import json, glob, re
+files = sorted(
+    glob.glob('$RESULTS_DIR/stage_*_lifecycle_metrics.json'),
+    key=lambda p: int(re.search(r'stage_(\d+)_', p).group(1)),
+)
+if len(files) <= 1:
+    exit()
+cum = 0.0
+offsets = []
+for f in files:
+    offsets.append(cum)
+    with open(f) as fh:
+        cum += json.load(fh).get('benchmark_time_seconds', 0)
+print(','.join(str(int(o)) for o in offsets))
+" 2>/dev/null || true)"
+
+PLOT_ARGS=("$RESULTS_DIR")
 if [ -n "$SUFFIX" ]; then
-    python3 "$SCRIPT_DIR/plot_two_variant_pipeline.py" "$RESULTS_DIR" --suffix "$SUFFIX"
-else
-    python3 "$SCRIPT_DIR/plot_two_variant_pipeline.py" "$RESULTS_DIR"
+    PLOT_ARGS+=(--suffix "$SUFFIX")
 fi
+if [ -n "$STAGE_SEC" ]; then
+    PLOT_ARGS+=(--stage-sec "$STAGE_SEC")
+fi
+python3 "$SCRIPT_DIR/plot_two_variant_pipeline.py" "${PLOT_ARGS[@]}"
 
 echo "Done. Outputs:"
 echo "  $RESULTS_DIR/metrics/processed/wva_target_timeseries.json"
