@@ -211,6 +211,13 @@ shared:
   harness:
     name: inference-perf
     experimentProfile: prefill_heavy_4k_2_6.yaml
+    # Default harness pod memory (32Gi) OOMKilled mid-run on the
+    # prefill_heavy_4k1k_* workloads' 1000-token mean output (same issue
+    # documented in two-variant-wva.yaml). Bumped for headroom; nodes have
+    # ~2TB allocatable so this costs nothing.
+    resources:
+      cpu: 16
+      memory: 64Gi
     # Prevent the entrypoint's 3-attempt retry loop from re-running the whole
     # workload when inference-perf exits non-zero due to per-request errors.
     # Without this, stage 1 errors (e.g. transient timeouts under load) trigger

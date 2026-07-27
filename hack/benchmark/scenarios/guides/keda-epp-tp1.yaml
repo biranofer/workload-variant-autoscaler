@@ -187,6 +187,14 @@ shared:
   harness:
     name: inference-perf
     experimentProfile: prefill_heavy_4k_2_6.yaml
+    # Default harness pod memory (32Gi) OOMKilled mid-run on the
+    # prefill_heavy_4k1k_* workloads' 1000-token mean output (same issue
+    # documented in two-variant-wva.yaml). This leg happened to complete
+    # without hitting it, but the risk is latent — bump for headroom; nodes
+    # have ~2TB allocatable so this costs nothing.
+    resources:
+      cpu: 16
+      memory: 64Gi
 
   storage:
     modelPvc:
