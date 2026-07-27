@@ -504,12 +504,15 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[i
                     t_stage = to_dt(lo + s)
                     ax.axvline(t_stage, color="gray", linestyle="--",
                                linewidth=1.0, alpha=0.7)
-            # Label only on the top panel.
+            # Label only on the top panel. Convention: the caller passes each
+            # stage's start offset followed by one final run-end offset, so
+            # the last entry is labeled "end" rather than another "stage N".
             for i, s in enumerate(stage_sec):
                 t_stage = to_dt(lo + s)
+                label = " end" if i == len(stage_sec) - 1 else f" stage {i + 1}"
                 axes[0].text(
                     t_stage, axes[0].get_ylim()[1],
-                    f" stage {i + 1}",
+                    label,
                     fontsize=7, color="gray", va="top", ha="left",
                 )
 

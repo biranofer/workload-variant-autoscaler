@@ -43,6 +43,8 @@ echo "[6/6] plot_two_variant_pipeline.py"
 # Stage-transition lines: cumulative offsets (seconds from run start) computed
 # from each stage_N_lifecycle_metrics.json's own measured benchmark_time_seconds
 # (not the workload's nominal duration — actual elapsed time drifts a little).
+# A final entry marks the end of the last stage (plot script labels the last
+# entry "end", all prior entries "stage N" — see plot_two_variant_pipeline.py).
 # Only meaningful for multi-stage workloads; skipped for single-stage runs.
 STAGE_SEC="$(python3 -c "
 import json, glob, re
@@ -58,6 +60,7 @@ for f in files:
     offsets.append(cum)
     with open(f) as fh:
         cum += json.load(fh).get('benchmark_time_seconds', 0)
+offsets.append(cum)
 print(','.join(str(int(o)) for o in offsets))
 " 2>/dev/null || true)"
 
