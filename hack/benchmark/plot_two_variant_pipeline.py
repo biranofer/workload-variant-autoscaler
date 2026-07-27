@@ -507,9 +507,10 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[i
             # Label only on the top panel. Convention: the caller passes each
             # stage's start offset followed by one final run-end offset, so
             # the last entry is labeled "end" rather than another "stage N".
+            # 0-indexed to match the harness's own stage_0/1/2/... naming.
             for i, s in enumerate(stage_sec):
                 t_stage = to_dt(lo + s)
-                label = " end" if i == len(stage_sec) - 1 else f" stage {i + 1}"
+                label = " end" if i == len(stage_sec) - 1 else f" stage {i}"
                 axes[0].text(
                     t_stage, axes[0].get_ylim()[1],
                     label,
