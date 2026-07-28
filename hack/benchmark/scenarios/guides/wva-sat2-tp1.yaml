@@ -81,28 +81,37 @@ shared:
 
   # --------------------------------------------------------------------------
   # EPP PLUGIN CONFIG — flowControl gate required for KEDA trigger
+  #
+  # NOTE: key is `router.epp.*`, not a top-level `inferenceExtension:` block --
+  # same wrong-key mistake as two-variant-wva.yaml, root-caused 2026-07-26.
+  # `inferenceExtension.pluginsConfigFile`/`pluginsCustomConfig` is
+  # llm-d-benchmark's GUIDE input-format naming (its "convert-guide" skill),
+  # not a key a benchmark SCENARIO file is templated against. The real key is
+  # `router.epp.pluginsConfigFile`/`pluginsCustomConfig` (confirmed against
+  # the rendered config.yaml and llm-d-benchmark's workload/README.md).
   # --------------------------------------------------------------------------
-  inferenceExtension:
-    pluginsConfigFile: "wva-plugins.yaml"
-    pluginsCustomConfig:
-      wva-plugins.yaml: |
-        apiVersion: inference.networking.x-k8s.io/v1alpha1
-        kind: EndpointPickerConfig
-        featureGates:
-          - flowControl
-        plugins:
-          - type: queue-scorer
-          - type: kv-cache-utilization-scorer
-          - type: prefix-cache-scorer
-        schedulingProfiles:
-          - name: default
-            plugins:
-              - pluginRef: queue-scorer
-                weight: 2
-              - pluginRef: kv-cache-utilization-scorer
-                weight: 2
-              - pluginRef: prefix-cache-scorer
-                weight: 3
+  router:
+    epp:
+      pluginsConfigFile: "wva-plugins.yaml"
+      pluginsCustomConfig:
+        wva-plugins.yaml: |
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          featureGates:
+            - flowControl
+          plugins:
+            - type: queue-scorer
+            - type: kv-cache-utilization-scorer
+            - type: prefix-cache-scorer
+          schedulingProfiles:
+            - name: default
+              plugins:
+                - pluginRef: queue-scorer
+                  weight: 2
+                - pluginRef: kv-cache-utilization-scorer
+                  weight: 2
+                - pluginRef: prefix-cache-scorer
+                  weight: 3
 
   # --------------------------------------------------------------------------
   # VLLM COMMON
