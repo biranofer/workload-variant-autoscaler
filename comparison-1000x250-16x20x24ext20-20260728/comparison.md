@@ -55,6 +55,7 @@ All seven runs confirmed clean: zero `FailedScheduling` events during any run's 
 | avg EPP queue depth          |            4.7 |            2.0 |                    4.7 |                       1.4 |                        2.1 |                        1.4 |      0.0 |
 | avg pod startup (s)          |             95 |             89 |                     93 |                        81 |                         82 |                         98 |       94 |
 | TTFT p50 (ms)                |             90 |             80 |                     80 |                        70 |                         80 |                         80 |       50 |
+| TTFT p90 (ms)                |          3,490 |          2,360 |                  4,300 |                     1,480 |                        680 |                        620 |       90 |
 | TTFT p95 (ms)                |          4,950 |          4,110 |                  6,180 |                     3,750 |                      2,200 |                      2,520 |      110 |
 | TTFT p99 (ms)                |          8,310 |          6,760 |                  8,240 |                     6,440 |                      4,300 |                      5,690 |      190 |
 | Request latency p50 (ms)     |          3,720 |          3,300 |                  3,430 |                     3,250 |                      3,380 |                      3,600 |    2,590 |
