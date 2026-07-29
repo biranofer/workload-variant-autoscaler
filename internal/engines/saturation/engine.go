@@ -259,7 +259,7 @@ func NewEngine(client client.Client, apiReader client.Reader, scheme *runtime.Sc
 		Config: executor.Config{
 			OptimizeFunc: engine.optimize,
 		},
-		Interval:     30 * time.Second,
+		Interval:     cfg.OptimizationInterval(),
 		RetryBackoff: 100 * time.Millisecond,
 	})
 
@@ -355,19 +355,6 @@ func (e *Engine) optimize(ctx context.Context) (retErr error) {
 
 	logger := ctrl.LoggerFrom(ctx)
 	e.recordDefaultConfigMetrics() // record as soon as possible to reflect any changes in configuration
-
-	// Get optimization interval from Config (already a time.Duration)
-	interval := e.Config.OptimizationInterval()
-
-	// Update the executor interval if changed
-	// Note: simple polling executor might not support dynamic interval update easily without restart,
-	// but here we just check it. The original code used RequeueAfter.
-	// The PollingExecutor uses fixed interval.
-	// TODO: Support dynamic interval in Executor if needed. For now, we log and proceed.
-	if interval > 0 {
-		// e.executor.SetInterval(interval) // If supported
-		_ = interval
-	}
 
 	if e.Config.ScaleToZeroEnabled() {
 		logger.Info("Scaling to zero is enabled")
