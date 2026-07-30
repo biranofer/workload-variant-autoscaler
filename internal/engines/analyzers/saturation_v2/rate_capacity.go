@@ -52,7 +52,7 @@ import (
 //
 // With this false, SaturationAnalyzer.serviceRates stays nil and every path in
 // this file returns immediately, leaving the occupancy-based estimator unchanged.
-const EnableRateAnchoredK2 = false
+const EnableRateAnchoredK2 = true
 
 const (
 	// ServiceRateWindow is how long an observation stays authoritative for its
