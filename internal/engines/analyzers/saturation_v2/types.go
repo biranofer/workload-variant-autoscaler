@@ -10,17 +10,21 @@ const learnedFromLive = "live"
 type k2Source int
 
 const (
-	k2SrcObserved   k2Source = iota + 1 // queue saturated: tokensInUse
-	k2SrcHistorical                     // rolling average from prior observations
-	k2SrcDerived                        // estimated from deployment args
-	k2SrcFallback                       // fallback to k1 (memory-bound)
+	k2SrcObserved     k2Source = iota + 1 // queue saturated: tokensInUse
+	k2SrcHistorical                       // rolling average from prior observations
+	k2SrcDerived                          // estimated from deployment args
+	k2SrcFallback                         // fallback to k1 (memory-bound)
+	k2SrcRateAnchored                     // rate-anchored: the bucket's learned token ceiling
+	k2SrcRateBacklog                      // rate-anchored: limit measured this cycle, nothing carried over
 )
 
 var k2Labels = map[k2Source]string{
-	k2SrcObserved:   "P1-obs",
-	k2SrcHistorical: "P2-hist",
-	k2SrcDerived:    "P3-k2",
-	k2SrcFallback:   "P4-k1",
+	k2SrcObserved:     "P1-obs",
+	k2SrcHistorical:   "P2-hist",
+	k2SrcDerived:      "P3-k2",
+	k2SrcFallback:     "P4-k1",
+	k2SrcRateAnchored: "RATE-learned",
+	k2SrcRateBacklog:  "RATE-now",
 }
 
 const (
