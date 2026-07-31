@@ -20,44 +20,45 @@ Branch: `validate/rate-anchored-k2`
 
 [PR #1501](https://github.com/llm-d/llm-d-workload-variant-autoscaler/pull/1501) (`feat/rate-anchored-k2`) adds a second, rate-anchored estimator for the V2 saturation analyzer's compute-bound capacity term (`k2`), behind an internal switch (`EnableRateAnchoredK2`). Its own motivation cites this repo's [`comparison-1000x250-16x20x24ext20-20260728`](../comparison-1000x250-16x20x24ext20-20260728/comparison.md) finding: WVA cycling replicas at 16.2% average KV utilization, because the existing `k2` estimator measures a KV **stock** while the real constraint on a prefill-heavy workload is a **rate**. Full problem/approach writeup: [`docs/plans/engine/rate-anchored-k2.md`](../docs/plans/engine/rate-anchored-k2.md) (on the PR branch).
 
-This doc validates the flag against the same sustained 1000/250 workload that motivated the PR: flag ON vs flag OFF at the shipped-default KEDA `scaleDown` policy, plus a third leg pairing flag ON with the metered `Pods 1/120s` policy that a prior, unrelated sweep ([`comparison-1000x250-16x20x24ext20-20260728`](../comparison-1000x250-16x20x24ext20-20260728/comparison.md)) found to be the single best-performing WVA configuration on this workload. Same cluster state throughout; controller restarted between legs to flush in-memory `k2` history.
+This doc validates the flag against the same sustained 1000/250 workload that motivated the PR: flag ON vs flag OFF at the shipped-default KEDA `scaleDown` policy, plus two legs pairing flag ON with the metered `Pods 1/120s` policy that a prior, unrelated sweep ([`comparison-1000x250-16x20x24ext20-20260728`](../comparison-1000x250-16x20x24ext20-20260728/comparison.md)) found to be the single best-performing WVA configuration on this workload — one at the PR's original revision, one after the PR was updated (5 additional `saturation-v2` fixes, `f4856bb1..89d152e2`). Same cluster state throughout; controller restarted between legs to flush in-memory `k2` history.
 
 ## Setup
 
-Single TP=1 decode deployment (1 GPU/pod), min=1/max=10, `scaleUpThreshold=0.75`, `scaleDownBoundary=0.60` (live-patched into the saturation ConfigMap) for all three legs. ScaledObject `scaleUp` Percent100/15s (window 0s) throughout; `scaleDown` is Percent100/15s (window 300s, shipped default) for the ON/OFF legs and `Pods 1/120s` (window 300s) for the third leg.
+Single TP=1 decode deployment (1 GPU/pod), min=1/max=10, `scaleUpThreshold=0.75`, `scaleDownBoundary=0.60` (live-patched into the saturation ConfigMap) for all four legs. ScaledObject `scaleUp` Percent100/15s (window 0s) throughout; `scaleDown` is Percent100/15s (window 300s, shipped default) for the ON/OFF legs and `Pods 1/120s` (window 300s) for the third and fourth legs.
 
-Flag toggled via two separately built images (`EnableRateAnchoredK2` is a Go build-time const, not runtime-toggleable): `ghcr.io/biranofer/llm-d-workload-variant-autoscaler:rate-anchored-k2-on` and `...-off`, both built from the same commit (`46c22692`, PR branch merged onto fresh `upstream/main`).
+Flag toggled via two separately built images (`EnableRateAnchoredK2` is a Go build-time const, not runtime-toggleable): `ghcr.io/biranofer/llm-d-workload-variant-autoscaler:rate-anchored-k2-on` and `...-off`. The first three legs used images built from commit `46c22692` (PR branch merged onto fresh `upstream/main`); the fourth leg used a rebuilt `-on` image after merging the PR's 5 additional commits (`89d152e2`, commit `38db3553` on this branch).
 
 **Workload** (`prefill_heavy_1000_250_16_20_24x20`, Poisson arrival): input 1000±50 tokens, output 250±25 tokens. 3 stages: 5 min @ rate 16, 5 min @ rate 20, 20 min @ rate 24. 39,600 requests total. Both runs confirmed clean (harness reported zero crashes; the error counts below are HTTP-level request failures, not harness failures).
 
 ## Results
 
-| metric                        | ON, Percent100 | OFF, Percent100 | ON, Pods1/120s |
-|--------------------------------|---------------:|----------------:|---------------:|
-| requests                       |         39,600 |           39,600 |         39,600 |
-| errors                         |             67 |               132 |            123 |
-| error rate                     |          0.17% |             0.33% |          0.31% |
-| avg replicas                   |           2.09 |              1.82 |           1.67 |
-| max replicas                   |              5 |                 4 |              3 |
-| cost (avg replicas × GPU/hr)   |           2.09 |              1.82 |           1.67 |
-| avg KV cache utilization       |          12.9% |             15.0% |          15.8% |
-| avg EPP queue depth            |           2.19 |              3.54 |           2.04 |
-| avg pod startup (s)            |             88 |                86 |             95 |
-| TTFT mean (s)                  |           0.74 |              0.79 |           0.61 |
-| TTFT p50 (s)                   |           0.08 |              0.08 |           0.08 |
-| TTFT p90 (s)                   |           3.24 |              3.70 |           1.44 |
-| TTFT p99 (s)                   |           7.58 |              7.40 |           8.36 |
-| Request latency mean (s)       |           6.27 |              6.34 |           5.87 |
-| Request latency p99 (s)        |          21.96 |             22.51 |          23.34 |
-| ITL mean (s)                   |          0.021 |              0.021 |          0.020 |
+| metric                        | ON, Percent100 | OFF, Percent100 | ON, Pods1/120s | ON, Pods1/120s (PR update) |
+|--------------------------------|---------------:|-----------------:|----------------:|-----------------------------:|
+| requests                       |         39,600 |            39,600 |          39,600 |                        39,600 |
+| errors                         |             67 |                132 |             123 |                             1 |
+| error rate                     |          0.17% |              0.33% |           0.31% |                        0.003% |
+| avg replicas                   |           2.09 |               1.82 |            1.67 |                          2.07 |
+| max replicas                   |              5 |                  4 |               3 |                             4 |
+| cost (avg replicas × GPU/hr)   |           2.09 |               1.82 |            1.67 |                          2.07 |
+| avg KV cache utilization       |          12.9% |              15.0% |           15.8% |                         12.2% |
+| avg EPP queue depth            |           2.19 |               3.54 |            2.04 |                          2.64 |
+| avg pod startup (s)            |             88 |                 86 |              95 |                            94 |
+| TTFT mean (s)                  |           0.74 |               0.79 |            0.61 |                          0.61 |
+| TTFT p50 (s)                   |           0.08 |               0.08 |            0.08 |                          0.08 |
+| TTFT p90 (s)                   |           3.24 |               3.70 |            1.44 |                          1.44 |
+| TTFT p99 (s)                   |           7.58 |               7.40 |            8.36 |                          8.65 |
+| Request latency mean (s)       |           6.27 |               6.34 |            5.87 |                          5.76 |
+| Request latency p99 (s)        |          21.96 |              22.51 |           23.34 |                         23.92 |
+| ITL mean (s)                   |          0.021 |              0.021 |           0.020 |                         0.020 |
 
 Reproducing:
 
-| run              | results dir                                                              |
-|------------------|---------------------------------------------------------------------------|
-| ON, Percent100   | `biran-20260731-074630-265/results/inference-perf-1785473235-ils2ow_1/`   |
-| OFF, Percent100  | `biran-20260731-083127-585/results/inference-perf-1785475931-dc4q88_1/`   |
-| ON, Pods1/120s   | `biran-20260731-163922-172/results/inference-perf-1785505207-0yuu3c_1/`   |
+| run                         | results dir                                                              |
+|-----------------------------|-----------------------------------------------------------------------------|
+| ON, Percent100              | `biran-20260731-074630-265/results/inference-perf-1785473235-ils2ow_1/`     |
+| OFF, Percent100             | `biran-20260731-083127-585/results/inference-perf-1785475931-dc4q88_1/`     |
+| ON, Pods1/120s              | `biran-20260731-163922-172/results/inference-perf-1785505207-0yuu3c_1/`     |
+| ON, Pods1/120s (PR update)  | `biran-20260731-180318-128/results/inference-perf-1785510244-zimcvt_1/`     |
 
 For reference, the historical (pre-PR, effectively flag-off) `Pods1/120s` leg from the prior sweep: 78 errors (0.20%), 1.70 avg replicas, max 3, TTFT p99 4.30s.
 
@@ -89,6 +90,15 @@ Same shape: one mid-run collapse-to-1 (peak 3 at 05:46:39 → 1 by 05:52:16), re
 ```
 
 Every descent removes exactly one pod at a time, spaced ~110-120s apart (2→1 at 13:59:04; 3→2 at 14:08:06, then 2→1 at 14:09:57, 111s later) — the metering is real, but since peaks never exceed 3 here, a 2-step metered drain looks almost as fast as a cliff would. The meaningful difference from the Percent100 legs is the **peak size**: max 3 vs 5 (ON) or 4 (OFF), consistent with the historical finding that this policy is the cheapest lever tested on this workload — it just never lets the controller commit to as large a replica count in the first place.
+
+**Flag ON, Pods1/120s, PR update** — 7 transitions over ~36 min, ground-truth `ready_replicas`:
+
+```
+1 → 2 → 1 → 2 → 3 → 4 → 3 → 2
+15:04  :16  :22  :25  :26  :27  :32  :39
+```
+
+Never drops back to 1 after the initial ramp — every descent lands at 2 or higher for the rest of the run. This is the only leg of the four that doesn't have a mid-run collapse-to-1 at all.
 
 ## Graphs
 
@@ -140,17 +150,29 @@ with fewer replicas absorbing the same demand — but EPP flow-control queue pea
 three (143 vs 180 for ON/Percent100 and 146 for OFF/Percent100), so the smaller replica count
 doesn't uniformly worsen every queue signal.
 
+### Flag ON, Pods1/120s, PR update — same queue pressure, 1 error instead of 123
+
+![WVA flag ON, Pods1/120s, PR update pipeline](img/wva_on_pods1_120s_v2_pipeline.png)
+
+Replica count ramps `1→2→3→4` through the rate=24 stage and never fully drains — it settles at 2
+by the end rather than collapsing to 1. The demand spikes here are, if anything, the **largest**
+of all four legs (vLLM waiting queue peaks at 179 requests, EPP flow-control queue at 179 — both
+the highest values in this doc), yet the run finished with a single HTTP-level error. Same
+workload, same KEDA policy, same thresholds as the "ON, Pods1/120s" leg above — the only variable
+that changed is the 5 additional PR commits.
+
 ## Reading these numbers
 
 **Flag ON halves the error rate** (67 vs 132 failed requests) and **lowers EPP queue depth** substantially (2.19 vs 3.54 avg) — consistent with the rate-anchored estimator tracking real arrival throughput rather than an inflated KV-stock history. Request latency p99 is marginally better under ON (21.96s vs 22.51s); TTFT p50 is identical (0.08s either way), p90 favors ON (3.24s vs 3.70s), p99 slightly favors OFF (7.58s vs 7.40s) — mean/p90 lean ON, p99 is noise-level either way.
 
 **The dramatic difference the plan doc predicted did not show up in replica-count stability.** [`docs/plans/engine/rate-anchored-k2.md`](../docs/plans/engine/rate-anchored-k2.md)'s validation section expected the "two overshoot-correct cycles" seen in the original comparison run to *disappear* under flag ON. Instead, both Percent100 legs here show the **same shape**: one mid-run ramp-to-peak → collapse-to-1 → partial recovery cycle, comparable in timing and amplitude. The oscillation pattern itself doesn't visibly improve at this specific rate profile — the win shows up in error rate and queue depth, not in replica-count behavior.
 
-**Pairing flag ON with the historically best KEDA policy (`Pods1/120s`) does not reproduce that policy's historical result — it's worse on reliability than the pre-PR baseline at the same policy.** The prior sweep found `Pods1/120s` (flag effectively off, since the PR didn't exist yet) to be the single best-performing WVA leg on this workload: 78 errors (0.20%), TTFT p99 4.30s, 1.70 avg replicas. Today's flag-ON leg at the same KEDA policy: 123 errors (0.31%), TTFT p99 8.36s, 1.67 avg replicas — nearly identical cost, but ~58% more errors and ~94% worse TTFT p99. This is the opposite of what pairing the two "good" levers should produce. The likely confound: `GLOBAL_OPT_INTERVAL` was fixed between that sweep and today (30s→15s optimize loop, [[project_pr1487_optimize_interval]]) — a faster reconcile loop could interact differently with a metered scale-down policy than with the historical 30s cadence it was tuned against. This wasn't isolated with a same-day flag-OFF pair at this KEDA policy (not run, per request), so the flag's contribution here can't be separated from the optimize-interval confound or from ordinary run-to-run noise.
+**Pairing flag ON with the historically best KEDA policy (`Pods1/120s`) initially looked like a regression, but the PR's own follow-up commits fixed it.** The prior sweep found `Pods1/120s` (flag effectively off, since the PR didn't exist yet) to be the single best-performing WVA leg on this workload: 78 errors (0.20%), TTFT p99 4.30s, 1.70 avg replicas. The first flag-ON leg at that KEDA policy regressed hard: 123 errors (0.31%), TTFT p99 8.36s — nearly identical cost, but ~58% more errors and ~94% worse TTFT p99, the opposite of what pairing two "good" levers should produce. After merging 5 additional PR commits (`f4856bb1..89d152e2`, all further `saturation-v2` fixes) and re-running the *identical* config: **1 error** (down from 123), at a similar average replica count (2.07 vs 1.67) and against demand spikes that were, if anything, the largest of any leg tested (vLLM waiting queue and EPP flow-control queue both peaked at 179, the highest values in this doc). TTFT p99 is still worse than the historical baseline (8.65s vs 4.30s) and didn't improve from the pre-update leg — but the error-count fix is unambiguous and large, not noise-level.
 
 ## Honest conclusions
 
 1. **Flag ON is a real, if modest, improvement over flag OFF at the shipped-default KEDA policy**: half the error rate, lower EPP queue depth, at the cost of slightly higher average replica count (2.09 vs 1.82) — i.e. it trades a little more compute for meaningfully fewer failed requests.
-2. **Flag ON does not carry that improvement over to the historically best-tuned KEDA policy.** At `Pods1/120s`, today's flag-ON leg has more errors and worse TTFT p99 than the historical (pre-PR) leg at the same policy, despite matching its cost almost exactly. Without a same-day flag-OFF pair at this policy, this can't be cleanly attributed to the flag — the `GLOBAL_OPT_INTERVAL` change is a live confound — but it's a concerning enough signal that the "flag ON is a straightforward win" conclusion from leg 1a/1b should not be assumed to generalize to every KEDA configuration.
-3. **Not yet a decisive result on any of this.** Every leg here is one run (no repeat), back-to-back on the same cluster with no seed control on the Poisson load — some of every gap could be run-to-run noise. The ON/OFF error-rate gap at Percent100 is a large enough ratio (2x) to likely be real; the Pods1/120s regression against history is a large enough ratio (1.6x) to be worth a repeat before treating it as settled either way.
-4. **Next step**: leg 2 (decode-heavy 100/1000, flag ON) and leg 3 (symmetric 300/300 Poisson, flag ON regression control — must stay flat at 1 replica with zero errors, since a more conservative capacity estimate could turn "correctly holds at one replica" into spurious scale-up). Not started yet; results should be reviewed leg-by-leg, not auto-chained.
+2. **The PR's original revision paired badly with the historically best-tuned KEDA policy; the updated revision fixes the reliability regression, but not the tail latency.** At `Pods1/120s`, the original flag-ON leg had far more errors than the pre-PR baseline at the same policy (123 vs 78) despite matching its cost almost exactly. The updated PR revision (5 more commits) cut that to 1 error at the same config, under an even larger demand spike — a dramatic, unambiguous fix. TTFT p99, however, stayed elevated (~8.5s) versus the historical baseline's 4.30s in *both* PR revisions, so whatever the update fixed for reliability didn't touch tail latency.
+3. **Confounds remain for the tail-latency comparison against history**: `GLOBAL_OPT_INTERVAL` was fixed between the historical sweep and today (30s→15s optimize loop, [[project_pr1487_optimize_interval]]), and no same-day flag-OFF pair was run at `Pods1/120s` with either PR revision. The error-count improvement (123→1) is too large to be explained by that confound alone, but the persistent TTFT p99 gap against history could still be partly attributable to it rather than to the flag.
+4. **Every leg here is one run (no repeat), back-to-back on the same cluster with no seed control on the Poisson load** — the smaller gaps (e.g. ON vs OFF's TTFT p99 at Percent100) should be read as directional, not conclusive. The two large findings (ON/OFF error-rate at Percent100, and the 123→1 error fix at Pods1/120s) are big enough ratios to very likely be real effects.
+5. **Next step**: leg 2 (decode-heavy 100/1000, flag ON) and leg 3 (symmetric 300/300 Poisson, flag ON regression control — must stay flat at 1 replica with zero errors, since a more conservative capacity estimate could turn "correctly holds at one replica" into spurious scale-up). Not started yet; results should be reviewed leg-by-leg, not auto-chained. Given the PR update materially changed leg 1c's result, legs 2/3 should use the updated image, not the original.
