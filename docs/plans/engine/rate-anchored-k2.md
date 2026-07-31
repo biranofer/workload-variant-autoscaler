@@ -75,8 +75,9 @@ from rates; the measurement records it in the units the rest of the engine speak
 
 - `SaturationEnterRatio` (0.95) means the detector fires just before arrivals cross
   the service rate, and a lambda hovering at mu does not toggle it between cycles.
-- The service rate is a running maximum with slow decay; the ceiling is a running
-  minimum with slow upward relaxation. Neither tracks a single cycle.
+- The service rate is a mean over backlogged samples with a five-minute time constant;
+  the ceiling is a running miniμm with slow upward relaxation. Neither tracks a single
+  cycle, and neither can move in only one direction.
 - `MinServiceRateSamples` keeps one slow interval from establishing a limit.
 - lambda is smoothed over a residence time, so a completion-derived rate and an
   arrival rate are compared on the same time base.
@@ -101,10 +102,23 @@ throughput analyzer is enabled, which this plan removes as a dependency.
 | queue | `max_over_time(vllm:num_requests_waiting[1m])` | `QueueLength` | unconditional |
 | KV capacity | `vllm:cache_config_info` | `TotalKvCapacityTokens` | unconditional |
 
-No new PromQL. `QueryRequestRate` moves to a shared registrar called unconditionally
-by the saturation engine (`QueryKvUsageInstant` moves with it, since the throughput
-analyzer needs it and the registrar is shared); the throughput analyzer registers
-them only if absent, so either order works and neither panics.
+One new query, and it is not optional: `QueryQueueLengthInstant`, the waiting-request
+count without `max_over_time`. `QueryQueueLength` is the same counter as a one-minute
+peak, which the demand path wants and a capacity gate cannot use — the peak latches for
+a minute after a queue drains, long enough to record a replica that is now keeping up
+as though it were at its limit. The gate and the measurement have to be read at the
+same instant, so both instantaneous readings are collected.
+
+`QueryRequestRate` moves to a shared registrar called unconditionally by the saturation
+engine (`QueryKvUsageInstant` moves with it, since the throughput analyzer needs it and
+the registrar is shared); the throughput analyzer registers them only if absent, so
+either order works and neither panics.
+
+This is the one part of the change that is not behind the flag: with the estimator off,
+the controller still issues the extra per-pod query each cycle and populates two fields
+nothing reads. The cost is one range query per model per interval, and the alternative —
+registering it from inside a flagged path — would mean the flag could not be flipped
+without a collector restart.
 
 SGLang equivalents (`sglang:generation_tokens_histogram_count`, `sglang:token_usage`)
 are already defined and move with them.
@@ -181,8 +195,11 @@ now — a state in which nothing is at risk.
 
 ## Known limitations
 
-- **Requires EPP.** `ArrivalRate` comes from the EPP scheduler counter. Without it
-  the estimator declines and the existing chain applies unchanged.
+- **EPP is no longer required.** μ comes from completions
+  (`vllm:request_generation_tokens_count`), the ceiling from occupancy under backlog, and `W`
+  from TTFT and ITL — all vLLM-side. The EPP dispatch rate now only distinguishes the
+  `RATE-now` label from `RATE-learned`. The earlier hard dependency is gone; worth correcting
+  in #1500 and #1501.
 - **Needs backlog to calibrate.** A fleet that never queues never learns `μ` and
   falls back to the memory bound — acceptable, since nothing is at risk there, but
   it makes emitting `k2Source` mandatory rather than optional.
@@ -203,12 +220,139 @@ spare capacity (the shed-to-one), while the rate path reads λ still at the ceil
 and holds capacity at the current load. That is the behaviour the cluster legs must
 confirm, and it is pinned by a test at the `computeReplicaCapacity` level.
 
+## Round 1 result — supply was the smaller half of the problem
+
+Measured 2026-07-31 on the sustained 1000/250 workload, two images from one commit:
+the flag moved the amplitude (5 replicas at peak vs 4, 67 errors vs 132, EPP queue 2.19 vs
+3.54) and left the collapse-to-one cycle intact.
+
+A ceiling alone cannot stop that cycle. Demand is resident tokens, `λ × W × tokensPerRequest`,
+so it falls when replicas are added: contention drops, residence `W` drops, and the queue
+term — the dominant part at the peak — disappears outright. Supply held flat against a
+shrinking demand reads as abundant spare capacity, and the fleet sheds the replicas that had
+just fixed the problem. At the run's numbers: five replicas at a ~320k bound is 1.6M of
+supply against ~258k of demand once the backlog cleared, so `SC = 1.6M — 258k/0.60 = 1.17M`
+- over three replicas' worth of "spare", acted on in one cycle.
+
+### The correction: capacity at the current operating point
+
+By Little's law a replica at its limit holds `μ × W × tokensPerRequest` tokens, so that
+product IS capacity in the units the engine already speaks, at whatever operating point `W`
+describes:
+
+```go
+capacity = min(ceiling, μ × W × tokensPerRequest)
+```
+
+Demand is `λ × W × tokensPerRequest`, so the ratio becomes `λ / (N × μ)` — it does not
+move when replicas are added, only λ per replica does. The alternative was to rewrite the
+demand term as `(λ/μ) × ceiling`, the same mathematics from the other side, but that changes
+a quantity the optimizer and the role-aggregation path share. This stays inside the flag.
+
+Three properties the implementation depends on:
+
+- **Nothing jumps when it engages.** At calibration λ = μ, so the product equals the
+  occupancy that set the ceiling.
+- **One direction only.** `W` comes from TTFT, which includes time queued, so a backlogged
+  replica reports an inflated `W`. The clamp at the ceiling is not a safety rail — it is what
+  makes the forμla correct while the queue contaminates `W`. After a drain the queue wait is
+  gone, `W` is true service residence, and the scaling is exact.
+- **Bucket-wide, not per-replica.** `FreezeWork` averages the previous cycle's samples across
+  the bucket's replicas and publishes one value at the top of `Analyze`, so the median in
+  `aggregateByVariant` stays a no-op. Averaging rather than folding each sample as it arrives
+  matters: every replica reports at the same timestamp, so folding would give the first
+  replica of the loop the entire weight and make capacity depend on iteration order — a
+  freshly started replica with a short residence could pull the bucket down and drive a
+  spurious scale-up. It costs one cycle of lag.
+
+Three related corrections came with it:
+
+- **Ceilings are recorded only under backlog.** Arrivals reaching the service rate still says
+  the replica is at its limit — that is how the limit is caught before a queue forms — but
+  with no queue, low occupancy means the replica is keeping up, not that its ceiling fell.
+  Recording it ratcheted capacity down on evidence of health.
+- **μ is the mean of backlogged samples, not their running maxiμm.** The ceiling is a running
+  miniμm, so it errs toward less capacity and more replicas; a running maxiμm for μ erred
+  the opposite way and only decayed back slowly. When prompts get heavier within a bucket the
+  true μ falls, and an estimate that can only ratchet up overstates capacity and under-scales.
+  Under backlog the server is never idle, so every sample is a valid reading, and their mean
+  is both the better estimate and the one that moves in either direction.
+- **The ceiling is measured from the instantaneous KV reading**, not `TokensInUse`
+  (`max_over_time(...[1m])`). A running miniμm fed a peak is biased high in the one
+  direction that costs replicas. `KvUsageInstant` is already collected; the older field
+  remains the fallback.
+
+### What this predicts for the round-1 workload
+
+The run completed 39 600 requests (mean λ 22 req/s) on 2.09 average replicas at 0.17% errors,
+so per-replica service rate is about **μ = 22/2.09 ≈ 10.5 req/s** — a throughput identity, not
+an estimate. At N=2 that is ρ ≈ 1.05: throughput fine, queue unbounded, which is exactly the
+measured 140-deep queue and 7.58 s TTFT p99. With `scaleUpThreshold = 0.75` the band is
+`N in [λ/(0.75 μ), λ/(0.60 μ)]`, so at the sustained λ = 24 the fleet settles at
+**3–4 replicas**, and shedding to one would require `λ < 0.6 μ ≈ 6.3 req/s`. The old fixed
+point of 2.09 was not "enough" — it was ρ ≈ 1, reported as 12.9% utilization because a request
+waiting in the queue holds no KV at all.
+
+### Reading the limit, and reading it early
+
+Two rules decide when a replica is at its limit, and they are read on one time base.
+`QueueLength` and `TokensInUse` are collected as `max_over_time(...[1m])`, so the peak
+latches for a minute; `QueryQueueLengthInstant` and `KvUsageInstant` are point samples.
+Pairing a latched gate with a point sample is what let a drained replica be recorded as
+its own limit, collapsing the ceiling to its floor. `limitEvidence` pairs them
+explicitly — instantaneous with instantaneous, or the one-minute peak of both.
+
+Only a replica that is both backlogged **and** completing work may define a ceiling,
+and lowering one takes `MinCeilingLowerCycles` consecutive cycles of agreement. A pod
+that has just become ready takes a routed burst before its cache fills; a stalled pod
+queues without completing anything. Either looks backlogged at almost zero occupancy,
+and since the ceiling is a minimum across the bucket, either would set capacity for
+every healthy sibling.
+
+Arrivals reaching the service rate is not a measurement of the limit — with no queue,
+low occupancy means the replica is keeping up — but it is a reliable signal that the
+limit has been reached. Capacity is then held at the current occupancy, so demand meets
+it and the fleet scales **before** a queue forms. That matters more than it looks: a
+replica takes about ninety seconds from decision to serving, so the backlog that builds
+during a scale-up is set by how early the decision was made, not by how fast the loop
+runs afterward.
+
+### The bucket key is a property of the variant
+
+The shape that keys a bucket is averaged across the variant's replicas. Replicas of one
+variant serve the same traffic, so their per-replica averages differ only by sampling
+noise — but that noise is enough to put two siblings either side of a threshold, where
+they learn independent ceilings and service rates. `aggregateByVariant` takes the MEDIAN
+of per-replica capacities, so those two figures get blended even though they measure
+different things, and a variant sitting near a threshold flips its estimate every cycle
+as replicas drift across it. Input and output thresholds are also separate now: prompts
+run an order of magnitude longer than generations, and bucketing input at the output
+thresholds put almost every real workload in one bucket.
+
+### Residual risks
+
+- **Mixed time bases.** Demand still uses `TokensInUse`, a 1-minute peak, while capacity uses
+  1-minute average TTFT/ITL. The two `W`s do not cancel exactly and the ratio is biased high
+  — toward more replicas, so safe for this failure, but systematic. Changing the demand term
+  is outside the flag and was deliberately left alone.
+- **The band is only 1.25× wide.** With integer `N` and a noisy λ, a one-replica flap is
+  still possible. Stabilization is not obviated by this fix.
+- **A wrong μ cannot be rescued by any of this**, which is why the instrumentation below
+  blocks the next leg.
+
 ## Validation
 
+0. **Instrumentation, and it blocks everything else.** Round 1 shipped without emitting
+   `k2Source`, μ, λ or the learned ceiling, which is why its result had to be reconstructed
+   from replica timelines. Emit them per variant and role, along with replica demand split
+   into its occupancy, local-queue and rate components, before any further leg.
 1. **Offline** — replay the recorded metrics from the sustained 1000/250 run through
    both estimators and compare `k2` against replica count and queue depth. The
-   prediction: the current estimator plateaus high after each queue drain, the
-   rate-anchored one tracks `λ/μ` and stays bound.
+   prediction: only the operating-point capacity holds its replica count through a queue
+   drain; the occupancy estimator plateaus high after each one.
+
+   Success criteria, fixed in advance: **zero shed-to-one events while λ ≥ 20 req/s** is
+   primary. Average replica count is not, and is expected to rise toward 3–4.
 2. **Cluster** — three legs, KEDA `scaleDown` restored to the shipped
    `Percent 100 / 15s` so the drain cap cannot mask the result, controller restarted
    between legs:

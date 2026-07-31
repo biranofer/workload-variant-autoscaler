@@ -1,8 +1,10 @@
 package saturation_v2
 
 import (
+	"cmp"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -60,11 +62,29 @@ const (
 	// rare, so this is generous relative to the optimize interval.
 	ServiceRateWindow = 30 * time.Minute
 
-	// ServiceRateDecayPerWindow is the fraction the retained service rate decays to
-	// over one ServiceRateWindow with no fresh observation. Decay matters because
-	// the rate is a running maximum: without it, one unusually fast interval would
-	// pin it high for as long as the entry lives.
-	ServiceRateDecayPerWindow = 0.75
+	// ServiceRateSmoothingWindow is the time constant over which mu tracks the
+	// completion rates observed under backlog. While a replica is backlogged it is
+	// never idle, so every such sample IS its service rate — there is no reason to
+	// prefer the largest, and a running maximum could only ratchet upward. It has to
+	// move down as readily as up: when prompts get longer within a bucket the true
+	// mu falls, and an estimate that lags overstates capacity and under-scales.
+	//
+	// Five minutes is responsive within a load stage without chasing a single scrape.
+	ServiceRateSmoothingWindow = 5 * time.Minute
+
+	// WorkWindow is the window the bucket's operating point is held over, and it
+	// mirrors the demand side exactly: TokensInUse and QueueLength are collected as
+	// max_over_time(...[1m]), so the operating point is the MAXIMUM of what replicas
+	// reported over the same minute.
+	//
+	// Matching the operator, not just the timescale, is what keeps the ratio stable
+	// through a transient. An average would decay smoothly while demand held its peak
+	// and then stepped down, so at the moment demand's window rolled off, capacity
+	// would still be high and the fleet would shed — the exact failure this estimator
+	// exists to prevent. Reacting within a single cycle instead would drop capacity
+	// while demand still carried the peak, spiking utilization into a scale-up right
+	// after the fleet caught up. Both sides rise and fall together.
+	WorkWindow = time.Minute
 
 	// CeilingRelaxPerWindow is the factor the learned token ceiling relaxes by over
 	// one ServiceRateWindow with no fresh observation. The ceiling is a running
@@ -73,10 +93,20 @@ const (
 	// drifts back toward the memory bound in the absence of evidence.
 	CeilingRelaxPerWindow = 1.25
 
-	// MinServiceRateSamples is how many qualifying observations a bucket needs
-	// before its service rate is usable. One observation cannot distinguish a real
-	// limit from a single slow interval.
+	// MinServiceRateSamples is how many qualifying CYCLES a bucket needs before its
+	// service rate is usable. One cycle cannot distinguish a real limit from a single
+	// slow interval. Counting cycles rather than observations matters: every replica
+	// of a bucket reports in the same cycle, so counting observations would let two
+	// replicas satisfy this in one interval and defeat the guard.
 	MinServiceRateSamples = 2
+
+	// MinCeilingLowerCycles is how many consecutive cycles must agree before the
+	// learned ceiling is lowered. Lowering is the dangerous direction: the ceiling
+	// sets the whole loop gain, so a single unrepresentative reading — a replica that
+	// has just started and holds almost nothing, or one degraded pod among healthy
+	// siblings — would otherwise pin the entire bucket near the floor and take hours
+	// to relax back. Raising it needs no such delay.
+	MinCeilingLowerCycles = 2
 
 	// SaturationEnterRatio is the fraction of the service rate at which arrivals
 	// are treated as having reached it. Slightly below 1 so the limit is recognised
@@ -117,13 +147,45 @@ type bucketStore struct {
 	entries map[string]*bucketEntry
 }
 
+// bucketEntry holds one workload bucket's learned state. Every quantity is folded
+// once per cycle by BeginCycle rather than per observation: replicas of a bucket all
+// report within the same cycle at the same timestamp, so folding on arrival gives the
+// first replica the entire weight and makes the result depend on the order the loop
+// happened to reach them — which, since ReplicaMetrics is built by ranging a map, is
+// not even stable between cycles.
 type bucketEntry struct {
-	rate         float64 // mu: running max of completion rate under backlog
-	rateSamples  int
-	rateSeen     time.Time
-	ceiling      float64 // running min of resident tokens at the limit
-	ceilingSeen  time.Time
-	ceilingKnown bool
+	// touched is the last time any replica reported into this bucket. Observations
+	// accumulate and are only folded at the cycle boundary, so the folded timestamps
+	// lag by a cycle and cannot be used to decide staleness — a bucket observed but
+	// not yet folded would look infinitely old and be evicted with its samples.
+	touched time.Time
+
+	rate        float64 // mu: mean completion rate under backlog
+	rateSamples int     // qualifying cycles, not observations
+	rateSeen    time.Time
+	rateSum     float64 // this cycle's samples, averaged at the next cycle boundary
+	rateCount   int
+
+	ceiling       float64 // resident tokens at the limit; lowered only on sustained evidence
+	ceilingSeen   time.Time
+	ceilingKnown  bool
+	ceilingSum    float64 // this cycle's lowest qualifying observation
+	ceilingHas    bool
+	pendingLower  float64 // a lower reading waiting to be confirmed by another cycle
+	pendingCycles int
+
+	workSeen    time.Time
+	workSamples []workSample // one per cycle, held for WorkWindow
+	workFrozen  float64      // the value every replica of the bucket reads this cycle
+	workSum     float64      // this cycle's samples, averaged at the next cycle boundary
+	workCount   int
+}
+
+// workSample is one cycle's operating point: residence x tokens-per-request,
+// averaged across the replicas that reported it.
+type workSample struct {
+	at    time.Time
+	value float64
 }
 
 func newBucketStore() *bucketStore {
@@ -147,6 +209,7 @@ func (s *bucketStore) entry(key string, now time.Time) *bucketEntry {
 		e = &bucketEntry{}
 		s.entries[key] = e
 	}
+	e.touched = now
 	return e
 }
 
@@ -155,11 +218,7 @@ func (s *bucketStore) entry(key string, now time.Time) *bucketEntry {
 func (s *bucketStore) pruneLocked(timeout time.Duration, now time.Time) int {
 	removed := 0
 	for k, e := range s.entries {
-		last := e.rateSeen
-		if e.ceilingSeen.After(last) {
-			last = e.ceilingSeen
-		}
-		if now.Sub(last) > timeout {
+		if now.Sub(e.touched) > timeout {
 			delete(s.entries, k)
 			removed++
 		}
@@ -167,30 +226,25 @@ func (s *bucketStore) pruneLocked(timeout time.Duration, now time.Time) int {
 	return removed
 }
 
-// ObserveRate records a completion rate for a bucket, keeping the running maximum.
+// ObserveRate folds a completion rate into the bucket's service-rate estimate.
 // Callers must only pass rates measured while the replica had a backlog: with no
 // backlog, completions equal arrivals at any load and say nothing about the limit.
+//
+// Symmetric by construction. The ceiling is a running minimum, so it errs toward
+// less capacity and more replicas; a running maximum here would err the opposite
+// way, toward more capacity and fewer replicas, and only decay slowly back. Under
+// backlog every sample is a valid reading of the service rate, so the mean of them
+// is both the better estimate and the one that moves in either direction.
 func (s *bucketStore) ObserveRate(key string, rate float64, now time.Time) {
-	if rate <= 0 {
+	if !(rate > 0) || math.IsInf(rate, 0) { // NaN fails the > comparison
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e := s.entry(key, now)
-	if e.rateSamples == 0 {
-		e.rate, e.rateSamples, e.rateSeen = rate, 1, now
-		return
-	}
-	e.rateSamples++
-	// Compare against the decayed value so a stale peak yields to a fresh, lower
-	// observation rather than persisting until eviction.
-	if decayed := decayRate(e.rate, now.Sub(e.rateSeen)); rate >= decayed {
-		e.rate = rate
-	} else {
-		e.rate = decayed
-	}
-	e.rateSeen = now
+	e.rateSum += rate
+	e.rateCount++
 }
 
 // Rate returns the bucket's service-rate estimate, decayed by age, and false when
@@ -206,36 +260,58 @@ func (s *bucketStore) Rate(key string, now time.Time) (float64, bool) {
 	if now.Sub(e.rateSeen) > ServiceRateWindow {
 		return 0, false
 	}
-	r := decayRate(e.rate, now.Sub(e.rateSeen))
-	if r <= 0 {
+	if e.rate <= 0 {
 		return 0, false
 	}
-	return r, true
+	return e.rate, true
 }
 
 // ObserveCeiling records the resident token count measured while a replica was at
-// its limit, keeping the running minimum — the lowest occupancy at which a replica
-// was seen unable to keep up is the conservative reading of the bucket's capacity.
+// its limit. Within a cycle the lowest such reading wins; whether it becomes the
+// bucket's ceiling is decided at the cycle boundary, in applyCeiling.
 func (s *bucketStore) ObserveCeiling(key string, tokens float64, now time.Time) {
-	if tokens <= 0 {
+	if !(tokens > 0) || math.IsInf(tokens, 0) {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e := s.entry(key, now)
+	if !e.ceilingHas || tokens < e.ceilingSum {
+		e.ceilingSum, e.ceilingHas = tokens, true
+	}
+}
+
+// applyCeiling folds one cycle's observation into the learned ceiling. Callers hold
+// s.mu.
+//
+// Raising is immediate: an old pessimistic reading must give way to fresh evidence
+// rather than capping the bucket indefinitely. Lowering waits for MinCeilingLowerCycles
+// consecutive cycles to agree, and then adopts the least extreme of them, because a
+// ceiling that fell on one reading would hand a single cold or degraded replica the
+// power to set capacity for every sibling and hold it there for hours.
+func (e *bucketEntry) applyCeiling(tokens float64, now time.Time) {
 	if !e.ceilingKnown {
 		e.ceiling, e.ceilingKnown, e.ceilingSeen = tokens, true, now
 		return
 	}
-	// Compare against the relaxed value so an old pessimistic reading gives way to
-	// a fresh higher one instead of capping the bucket indefinitely.
-	if relaxed := relaxCeiling(e.ceiling, now.Sub(e.ceilingSeen)); tokens <= relaxed {
-		e.ceiling = tokens
-	} else {
-		e.ceiling = relaxed
+	// Compared against the ceiling itself, not against its relaxed value: an
+	// unchanged reading is infinitesimally below the relaxed figure every cycle, and
+	// treating that as a lowering would keep a pending candidate permanently open.
+	if tokens >= e.ceiling {
+		relaxed := relaxCeiling(e.ceiling, now.Sub(e.ceilingSeen))
+		e.ceiling, e.ceilingSeen = math.Min(tokens, relaxed), now
+		e.pendingLower, e.pendingCycles = 0, 0
+		return
 	}
-	e.ceilingSeen = now
+	e.pendingCycles++
+	if e.pendingCycles == 1 || tokens > e.pendingLower {
+		e.pendingLower = tokens
+	}
+	if e.pendingCycles >= MinCeilingLowerCycles {
+		e.ceiling, e.ceilingSeen = e.pendingLower, now
+		e.pendingLower, e.pendingCycles = 0, 0
+	}
 }
 
 // Ceiling returns the bucket's learned token ceiling, relaxed by age, and false
@@ -258,6 +334,107 @@ func (s *bucketStore) Ceiling(key string, now time.Time) (float64, bool) {
 	return c, true
 }
 
+// ObserveWork records this replica's work-per-request — residence time multiplied
+// by tokens per request, in token-seconds — as one sample of the bucket's operating
+// point, to be averaged and folded in at the next freeze.
+//
+// Samples accumulate rather than folding in one at a time, because every replica of
+// a bucket reports in the same cycle at the same timestamp. Folding each in turn
+// would give the first replica of the loop the entire weight — the rest arrive with
+// a zero time delta and change nothing — making the bucket's operating point depend
+// on iteration order. A replica that had just started, with a short residence, could
+// then pull the whole bucket's capacity down and drive a spurious scale-up.
+//
+// The value is deliberately not read back here: see FrozenWork.
+func (s *bucketStore) ObserveWork(key string, work float64, now time.Time) {
+	if work <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.entry(key, now)
+	e.workSum += work
+	e.workCount++
+}
+
+// FrozenWork returns the work-per-request every replica of the bucket scales by
+// this cycle, and false when none has been frozen yet.
+func (s *bucketStore) FrozenWork(key string, now time.Time) (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.entries[key]
+	if !ok || e.workFrozen <= 0 {
+		return 0, false
+	}
+	if now.Sub(e.workSeen) > ServiceRateWindow {
+		return 0, false
+	}
+	return e.workFrozen, true
+}
+
+// BeginCycle folds everything each bucket collected last cycle and publishes the
+// operating point this cycle's replicas will read. It must be called once at the top
+// of a cycle, before any replica is looked at.
+//
+// The service rate takes the cycle's mean, the ceiling its lowest qualifying reading,
+// and the operating point the maximum of the per-cycle means still inside WorkWindow
+// — the same operator the demand side is collected with, so both hold their peak and
+// step down together rather than one decaying past the other.
+//
+// Publishing at the cycle boundary is also what makes the operating point identical
+// across siblings: aggregateByVariant takes the MEDIAN of per-replica capacities, so a
+// value that moved as the loop progressed would blend incommensurable figures.
+//
+// Publishing at the cycle boundary is what makes the number identical across
+// siblings: aggregateByVariant takes the MEDIAN of per-replica capacities, so a
+// value that moved as the loop progressed would blend incommensurable figures. It
+// costs one cycle of lag, which is the price of that guarantee. Analyze is never
+// concurrent, so a plain sweep is enough.
+func (s *bucketStore) BeginCycle(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, e := range s.entries {
+		if e.rateCount > 0 {
+			sample := e.rateSum / float64(e.rateCount)
+			e.rateSum, e.rateCount = 0, 0
+			if e.rateSamples == 0 {
+				e.rate = sample
+			} else {
+				e.rate = ewmaStep(e.rate, sample, now.Sub(e.rateSeen).Seconds(), ServiceRateSmoothingWindow.Seconds())
+			}
+			e.rateSamples++
+			e.rateSeen = now
+		}
+
+		if e.ceilingHas {
+			e.applyCeiling(e.ceilingSum, now)
+			e.ceilingSum, e.ceilingHas = 0, false
+		}
+
+		if e.workCount > 0 {
+			e.workSamples = append(e.workSamples, workSample{at: now, value: e.workSum / float64(e.workCount)})
+			e.workSum, e.workCount = 0, 0
+			e.workSeen = now
+		}
+		e.workSamples = slices.DeleteFunc(e.workSamples, func(w workSample) bool {
+			return now.Sub(w.at) > WorkWindow
+		})
+		// An empty window means no live evidence of the operating point, so the
+		// estimator declines and falls back to the ceiling rather than scaling by a
+		// figure from before the gap.
+		if len(e.workSamples) == 0 {
+			e.workFrozen = 0
+			continue
+		}
+		e.workFrozen = slices.MaxFunc(e.workSamples, func(a, b workSample) int {
+			return cmp.Compare(a.value, b.value)
+		}).value
+	}
+}
+
 // EvictStale drops buckets with no observation of either kind within timeout,
 // returning the number removed. Mirrors EvictStaleHistory so the stores age out
 // together.
@@ -265,16 +442,6 @@ func (s *bucketStore) EvictStale(timeout time.Duration, now time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pruneLocked(timeout, now)
-}
-
-// decayRate applies exponential decay so an unrefreshed service rate loses
-// authority smoothly: after one ServiceRateWindow it retains
-// ServiceRateDecayPerWindow of its value.
-func decayRate(rate float64, age time.Duration) float64 {
-	if age <= 0 {
-		return rate
-	}
-	return rate * math.Pow(ServiceRateDecayPerWindow, age.Seconds()/ServiceRateWindow.Seconds())
 }
 
 // relaxCeiling grows an unrefreshed ceiling so capacity drifts back toward the
@@ -332,19 +499,25 @@ func (s *arrivalSmoother) Smooth(key string, rate, tau float64, now time.Time) f
 		s.entries[key] = &arrivalEntry{rate: rate, observed: now}
 		return rate
 	}
-	dt := now.Sub(e.observed).Seconds()
-	if dt <= 0 {
-		return e.rate
+	if dt := now.Sub(e.observed).Seconds(); dt > 0 {
+		e.rate = ewmaStep(e.rate, rate, dt, tau)
+		e.observed = now
 	}
-	// Older than a few time constants: the previous value carries no information.
-	if dt > tau*ArrivalSmoothingResetFactor {
-		e.rate, e.observed = rate, now
-		return rate
-	}
-	alpha := 1 - math.Exp(-dt/tau)
-	e.rate += alpha * (rate - e.rate)
-	e.observed = now
 	return e.rate
+}
+
+// ewmaStep folds sample into prev with a weight derived from the actual gap between
+// samples, so an irregular optimize interval or a missed cycle does not distort the
+// average. A gap longer than a few time constants discards prev outright: it carries
+// no information about the present.
+func ewmaStep(prev, sample, dt, tau float64) float64 {
+	if dt <= 0 || tau <= 0 {
+		return prev
+	}
+	if dt > tau*ArrivalSmoothingResetFactor {
+		return sample
+	}
+	return prev + (1-math.Exp(-dt/tau))*(sample-prev)
 }
 
 // EvictStale drops replicas not seen within timeout, returning the number removed.
@@ -366,6 +539,15 @@ func (s *arrivalSmoother) EvictStale(timeout time.Duration, now time.Time) int {
 // first token plus one inter-token latency per output token. Both inputs are
 // already collected per replica. Returns 0 when they are unavailable, which leaves
 // the arrival rate unsmoothed rather than smoothing it by a made-up constant.
+//
+// Only the upper bound is applied here. MinResidenceSeconds exists to keep a garbage
+// latency reading from turning the arrival average into a passthrough, and it is
+// applied at that call site — see smoothingTau. Applying it to capacity would be a
+// one-directional inflation: capacity is mu x W x tokensPerRequest, so a floor that
+// only ever raises W only ever raises supply, while demand has no matching floor. A
+// workload generating 16 tokens at 8ms each has a true residence near 0.2s, and
+// rounding that up to 1s overstates supply more than fourfold — enough that a fleet
+// at full utilization reports a quarter of it and never scales up at all.
 func residenceSeconds(rm domain.ReplicaMetrics) float64 {
 	if rm.AvgITL <= 0 || rm.AvgOutputTokens <= 0 {
 		return 0
@@ -374,11 +556,22 @@ func residenceSeconds(rm domain.ReplicaMetrics) float64 {
 	if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
 		return 0
 	}
-	if w < MinResidenceSeconds {
-		return MinResidenceSeconds
-	}
 	if w > MaxResidenceSeconds {
 		return MaxResidenceSeconds
+	}
+	return w
+}
+
+// smoothingTau is the residence estimate as an averaging time constant, floored so a
+// tiny reading cannot make the arrival average a passthrough. Returns 0 when there is
+// no usable residence, which leaves the rate unsmoothed.
+func smoothingTau(rm domain.ReplicaMetrics) float64 {
+	w := residenceSeconds(rm)
+	if w <= 0 {
+		return 0
+	}
+	if w < MinResidenceSeconds {
+		return MinResidenceSeconds
 	}
 	return w
 }
@@ -394,19 +587,72 @@ func residenceSeconds(rm domain.ReplicaMetrics) float64 {
 // property of the request shape, and 1000-token prompts and 300-token prompts are
 // different services on the same hardware. Keying only by output length would
 // average them.
-func serviceRateKey(modelID, accelerator, role string, gpuCount int, avgInput, avgOutput float64) string {
+func serviceRateKey(modelID, accelerator, role string, gpuCount int, shape variantShape) string {
 	return fmt.Sprintf("%s|%s|%s|%d|in:%s|out:%s",
 		modelID, accelerator, canonicalRole(role), gpuCount,
-		classifyOutputLength(avgInput), classifyOutputLength(avgOutput))
+		classifyInputLength(shape.avgInput), classifyOutputLength(shape.avgOutput))
+}
+
+// variantShape is the request shape of a variant as a whole, averaged over its live
+// replicas.
+//
+// The shape has to come from the variant, not from each replica, even though the
+// metrics are per-replica. Replicas of one variant serve the same traffic, so their
+// averages differ only by sampling noise — but that noise is enough to put two
+// siblings either side of a bucket threshold, and then they learn independent
+// ceilings and service rates. aggregateByVariant takes the MEDIAN of per-replica
+// capacities, so the two figures get blended even though they measure different
+// things, and a variant whose average sits near a threshold flips its whole estimate
+// every cycle as replicas drift across it. Keying on the variant makes the boundary a
+// property of the workload rather than of individual scrapes.
+type variantShape struct {
+	avgInput  float64
+	avgOutput float64
+}
+
+// variantShapes averages the request shape across each variant's replicas.
+func variantShapes(metrics []domain.ReplicaMetrics) map[string]variantShape {
+	type acc struct {
+		in, out float64
+		n       float64
+	}
+	sums := make(map[string]*acc, len(metrics))
+	for _, rm := range metrics {
+		if rm.AvgInputTokens <= 0 && rm.AvgOutputTokens <= 0 {
+			continue
+		}
+		a, ok := sums[rm.VariantName]
+		if !ok {
+			a = &acc{}
+			sums[rm.VariantName] = a
+		}
+		a.in += rm.AvgInputTokens
+		a.out += rm.AvgOutputTokens
+		a.n++
+	}
+	shapes := make(map[string]variantShape, len(sums))
+	for variant, a := range sums {
+		if a.n > 0 {
+			shapes[variant] = variantShape{avgInput: a.in / a.n, avgOutput: a.out / a.n}
+		}
+	}
+	return shapes
 }
 
 // rateAnchoredK2 returns the compute-bound capacity in KV tokens for this
-// replica's bucket, and which signal produced it.
+// replica's bucket, the load-independent reference to store, and which signal
+// produced the capacity.
 //
-// The value is the bucket's learned ceiling wherever one exists, so it is the same
-// for every replica of the variant and does not move with this cycle's arrival
-// rate. Before anything has been learned, a replica that is over its limit right
-// now still reports its own occupancy, so the first overload is not missed.
+// The capacity is the bucket's learned ceiling, scaled down by how far this cycle's
+// operating point sits below the one the ceiling was measured at — see
+// residenceScaledCapacity for why that scaling is the point of the whole design.
+// Before anything has been learned, a replica that is over its limit right now
+// still reports its own occupancy, so the first overload is not missed.
+//
+// The reference return is the unscaled ceiling. Capacity moves with contention and
+// so must never be persisted: the capacity store feeds variants with no live
+// replicas and cross-variant estimation, both of which need a number that means
+// "what this replica can do", not "what it is doing now".
 //
 // Returns false when nothing has been learned and the replica is not currently
 // over its limit, in which case the caller falls through to the occupancy-based
@@ -416,43 +662,161 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	modelID string,
 	role string,
 	gpuCount int,
+	shape variantShape,
 	k1 int64,
 	queueThreshold float64,
 	now time.Time,
-) (int64, k2Source, bool) {
+) (int64, int64, k2Source, bool) {
 	if a.serviceRates == nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 
-	key := serviceRateKey(modelID, rm.AcceleratorName, role, gpuCount, rm.AvgInputTokens, rm.AvgOutputTokens)
+	key := serviceRateKey(modelID, rm.AcceleratorName, role, gpuCount, shape)
 
-	// Detector: rates decide whether this replica is at its limit.
-	backlogged := float64(rm.QueueLength) >= queueThreshold
+	// Detector and measurement, read at the same instant — see limitEvidence.
+	backlogged, occupancy := limitEvidence(rm, queueThreshold)
 	if backlogged && rm.RequestRate > 0 {
 		a.serviceRates.ObserveRate(key, rm.RequestRate, now)
 	}
 	atLimit := backlogged || a.arrivalsReachedServiceRate(rm, key, now)
 
-	// Whether anything was known before this cycle, purely so the source label can
-	// distinguish a fresh measurement from a carried-over one. Both are the same
-	// number and take the same path; the distinction is for the cycle log.
-	_, hadCeiling := a.serviceRates.Ceiling(key, now)
-
-	// Measurement: at the limit, resident tokens are what the limit is worth.
-	occupancy := float64(rm.TokensInUse)
-	if atLimit && occupancy > 0 {
+	// A replica may only define the bucket's ceiling while it is both backlogged and
+	// completing work. Backlog alone is not enough: a replica that has just started
+	// takes a routed burst before its cache fills, and one that has stalled queues
+	// without completing anything. Either would report a tiny occupancy as "the
+	// occupancy at which this bucket cannot keep up" and, since the ceiling sets the
+	// whole loop gain, pin every sibling near the floor. Requiring completions is the
+	// same guard the service rate already applies, for the same reason.
+	//
+	// Arrivals reaching the service rate is enough to say the replica is at its limit
+	// — it is how the limit is caught before a queue forms — but it is not a
+	// measurement of one: with no queue, low occupancy is evidence the replica is
+	// keeping up, not that its ceiling has fallen.
+	if backlogged && rm.RequestRate > 0 && occupancy > 0 {
 		a.serviceRates.ObserveCeiling(key, occupancy, now)
+	}
+
+	// Every cycle, at the limit or not, contributes to the bucket's work-per-request.
+	// It is the operating point, not a measurement of the limit, so it is recorded
+	// unconditionally — the whole point is to know how far below the limit we sit.
+	if residence := residenceSeconds(rm); residence > 0 {
+		a.serviceRates.ObserveWork(key, residence*tokensPerRequest(rm), now)
 	}
 
 	ceiling, ok := a.serviceRates.Ceiling(key, now)
 	if !ok {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
+	// The three labels say which regime produced the number: at the limit right now,
+	// carrying a limit measured earlier, or holding a limit measured earlier scaled
+	// to a lighter operating point. That is what the offline replay has to separate.
 	src := k2SrcRateAnchored
-	if !hadCeiling {
+	if atLimit {
 		src = k2SrcRateBacklog
 	}
-	return clampCeiling(ceiling, k1), src, true
+
+	reference := clampCeiling(ceiling, k1)
+	capacity := reference
+	if scaled, ok := a.residenceScaledCapacity(key, ceiling, now); ok {
+		capacity = clampCeiling(scaled, k1)
+		src = k2SrcRateResidence
+	}
+
+	// Arrivals have caught up with the service rate while nothing has queued yet. The
+	// replica is at its limit, and reporting capacity above what it is already holding
+	// would hide that until a queue forms. Waiting for the queue is what this cannot
+	// afford: a replica takes about ninety seconds from decision to serving, so the
+	// backlog that accumulates while one starts is set by how early the decision was
+	// made. Capacity is held at the current occupancy, which reads as fully utilized
+	// without claiming the replica is over its limit.
+	//
+	// The figure used here is the one demand is built from, not the instantaneous
+	// sample the ceiling is measured with. Demand is TokensInUse, a one-minute peak;
+	// holding capacity at a lower instantaneous reading would make utilization the
+	// ratio between the two, which on bursty traffic is several times one and would
+	// ask for several times the replicas. Matching it lands utilization at exactly
+	// one: saturated, scale up by the threshold's margin, nothing more.
+	//
+	// One direction only, and floored by clampCeiling, so a mis-scraped arrival rate
+	// cannot drive capacity toward zero.
+	if demandSide := float64(rm.TokensInUse); atLimit && !backlogged &&
+		demandSide > 0 && demandSide < float64(capacity) {
+		capacity = clampCeiling(demandSide, k1)
+	}
+	return capacity, reference, src, true
+}
+
+// residenceScaledCapacity expresses the bucket's capacity at this cycle's operating
+// point, and reports false when it should be left at the measured ceiling.
+//
+// A ceiling alone cannot stop the collapse that validation round 1 measured. Demand
+// is resident tokens, lambda x W x tokensPerRequest, so it falls when replicas are
+// added: contention drops, residence W drops, and the queue term disappears
+// outright. Supply held flat against a shrinking demand reads as abundant spare
+// capacity, and the fleet sheds the replicas that had just fixed the problem.
+//
+// By Little's law a replica at its limit holds mu x W x tokensPerRequest tokens, so
+// that product IS the capacity in the units the engine speaks, at whatever operating
+// point W describes. Scaling supply by it makes demand/supply equal lambda/mu, which
+// does not move when replicas are added — only lambda per replica does. At the
+// moment of calibration the two agree exactly (lambda = mu there, so the product
+// equals the occupancy that set the ceiling), so nothing jumps when this engages.
+//
+// The result is clamped at the ceiling and never above it: W is derived from TTFT,
+// which includes time queued, so a backlogged replica reports an inflated W. Letting
+// that raise capacity would relax the bound exactly when the replica is failing. One
+// direction only — contention below the calibration point may lower capacity,
+// queueing above it may not raise it.
+func (a *SaturationAnalyzer) residenceScaledCapacity(key string, ceiling float64, now time.Time) (float64, bool) {
+	muRate, ok := a.serviceRates.Rate(key, now)
+	if !ok {
+		return 0, false
+	}
+	work, ok := a.serviceRates.FrozenWork(key, now)
+	if !ok {
+		return 0, false
+	}
+	scaled := muRate * work
+	if scaled <= 0 || math.IsNaN(scaled) || math.IsInf(scaled, 0) {
+		return 0, false
+	}
+	if scaled >= ceiling {
+		return 0, false
+	}
+	return scaled, true
+}
+
+// limitEvidence reports whether the replica is failing to keep up, and the resident
+// token count to record if it is. Both readings come from the same time base, and
+// that pairing is the point of the function.
+//
+// QueueLength and TokensInUse are collected as max_over_time(...[1m]): the demand
+// path wants the peak, since erring high on outstanding work is its safe direction.
+// Read one of them against an instantaneous sample of the other and the estimator
+// breaks in a specific, severe way — the latched queue keeps the gate open for a full
+// minute after a backlog clears, while the instantaneous occupancy has already
+// collapsed, so a replica that is now comfortably keeping up gets recorded as its own
+// limit. The ceiling then falls to its floor and the fleet scales out against it.
+//
+// So: instantaneous gate with instantaneous occupancy when both are collected,
+// otherwise the one-minute peak of both. Either pair is self-consistent.
+func limitEvidence(rm domain.ReplicaMetrics, queueThreshold float64) (bool, float64) {
+	if rm.HasQueueLengthInstant && rm.KvUsageInstant > 0 && rm.TotalKvCapacityTokens > 0 {
+		tokens := rm.KvUsageInstant * float64(rm.TotalKvCapacityTokens)
+		if tokens > 0 && !math.IsNaN(tokens) && !math.IsInf(tokens, 0) {
+			return rm.QueueLengthInstant >= queueThreshold, tokens
+		}
+	}
+	return float64(rm.QueueLength) >= queueThreshold, float64(rm.TokensInUse)
+}
+
+// tokensPerRequest is the KV footprint of one request of this bucket's shape.
+func tokensPerRequest(rm domain.ReplicaMetrics) float64 {
+	t := rm.AvgInputTokens + rm.AvgOutputTokens
+	if t <= 0 || math.IsNaN(t) || math.IsInf(t, 0) {
+		return 0
+	}
+	return t
 }
 
 // arrivalsReachedServiceRate reports whether arrivals have caught up with the
@@ -473,7 +837,7 @@ func (a *SaturationAnalyzer) arrivalsReachedServiceRate(rm domain.ReplicaMetrics
 	if smoothingKey == "" {
 		smoothingKey = key
 	}
-	lambda := a.arrivals.Smooth(smoothingKey, rm.ArrivalRate, residenceSeconds(rm), now)
+	lambda := a.arrivals.Smooth(smoothingKey, rm.ArrivalRate, smoothingTau(rm), now)
 	if lambda <= 0 {
 		lambda = rm.RequestRate
 	}

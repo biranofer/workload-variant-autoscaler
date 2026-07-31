@@ -36,6 +36,10 @@ type SaturationAnalyzer struct {
 	// comparable with the completion-derived service rate. Allocated with
 	// serviceRates.
 	arrivals *arrivalSmoother
+	// clock is time.Now in production. The rate-anchored estimator weights its
+	// averages by the real gap between cycles, so tests that drive several cycles in
+	// a row need to advance time to exercise it at all.
+	clock func() time.Time
 }
 
 // Option configures a SaturationAnalyzer at construction.
@@ -54,12 +58,29 @@ func withRateAnchoredK2(enabled bool) Option { //nolint:unparam // tests pass tr
 	}
 }
 
+// withClock replaces time.Now for tests that need to drive successive cycles.
+func withClock(clock func() time.Time) Option {
+	return func(a *SaturationAnalyzer) {
+		a.clock = clock
+	}
+}
+
+// now reads the analyzer's clock, tolerating a zero value so an analyzer built
+// without the constructor still works.
+func (a *SaturationAnalyzer) now() time.Time {
+	if a.clock == nil {
+		return time.Now()
+	}
+	return a.clock()
+}
+
 // NewSaturationAnalyzer creates a new V2 saturation analyzer backed by the
 // given capacity store.
 func NewSaturationAnalyzer(store *CapacityKnowledgeStore, opts ...Option) *SaturationAnalyzer {
 	a := &SaturationAnalyzer{
 		computeCapacityHistory: make(map[string]*rollingAverage),
 		capacityStore:          store,
+		clock:                  time.Now,
 	}
 	if EnableRateAnchoredK2 {
 		a.serviceRates = newBucketStore()
@@ -111,6 +132,20 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		rolesByVariant[vs.VariantName] = vs.Role
 	}
 
+	// Fold what last cycle observed and publish this cycle's operating point before
+	// any replica is looked at — see BeginCycle.
+	if a.serviceRates != nil {
+		a.serviceRates.BeginCycle(a.now())
+	}
+
+	// The request shape that keys a workload bucket is a property of the variant, not
+	// of whichever replica happens to be reporting — see variantShape. Only the
+	// rate-anchored estimator consumes it, so with that off this costs nothing.
+	var shapes map[string]variantShape
+	if a.serviceRates != nil {
+		shapes = variantShapes(input.ReplicaMetrics)
+	}
+
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]ReplicaCapacity, 0, len(input.ReplicaMetrics))
 	for _, rm := range input.ReplicaMetrics {
@@ -120,7 +155,8 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		default:
 		}
 		gpuCount := gpusByVariant[rm.VariantName]
-		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount, rolesByVariant[rm.VariantName])
+		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
+			rolesByVariant[rm.VariantName], shapes[rm.VariantName])
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
@@ -184,6 +220,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	modelID, namespace string,
 	gpuCount int,
 	role string,
+	shape variantShape,
 ) *ReplicaCapacity {
 	if rm.TotalKvCapacityTokens <= 0 {
 		// TODO: implement proper demand estimation when vllm:cache_config_info is absent.
@@ -222,13 +259,27 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// What it returns is a per-bucket ceiling measured at the limit, identical for
 	// every replica of the variant and stable across cycles — see rateAnchoredK2 for
 	// why anything per-replica or per-cycle was unusable downstream.
-	if rateK2, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, k1, config.QueueLengthThreshold, time.Now()); ok {
-		k2, k2Priority = rateK2, rateSrc
+	var rateReference int64
+	if rateK2, ref, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, shape, k1,
+		config.QueueLengthThreshold, a.now()); ok {
+		k2, rateReference, k2Priority = rateK2, ref, rateSrc
 	}
 
 	effectiveCapacity := k1
 	if k2 < k1 {
 		effectiveCapacity = k2
+	}
+
+	// What the store keeps is not what this cycle scaled on. The rate-anchored
+	// capacity moves with contention by design, while the store feeds variants with
+	// no live replicas and cross-variant estimation — both of which need the
+	// load-independent measurement.
+	storedCapacity := effectiveCapacity
+	if rateReference > 0 {
+		storedCapacity = k1
+		if rateReference < k1 {
+			storedCapacity = rateReference
+		}
 	}
 
 	isSaturated := replicaDemand >= effectiveCapacity
@@ -245,7 +296,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		NumGpuBlocks:          rm.NumGpuBlocks,
 		BlockSize:             rm.BlockSize,
 		TotalKvCapacityTokens: rm.TotalKvCapacityTokens,
-		EffectiveCapacity:     effectiveCapacity,
+		EffectiveCapacity:     storedCapacity,
 		EngineParams:          existingParams,
 		LearnedFrom:           learnedFromLive,
 	})
