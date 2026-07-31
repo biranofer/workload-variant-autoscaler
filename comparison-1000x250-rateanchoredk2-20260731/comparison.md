@@ -88,6 +88,9 @@ raw vLLM/EPP scrapes (no controller-log dependency), and the WVA-desired series 
 replaying the same "Applied saturation decision" pattern against the full controller log already
 saved in `results/.../wva-controller.log`.
 
+Dashed gray vertical lines mark the load-profile's stage transitions (rate 16→20→24, measured
+elapsed seconds per stage, not nominal) and the run's end.
+
 ### Flag ON — ramps to 5, one sharp collapse-to-1, recovers to 3
 
 ![WVA flag ON pipeline](img/wva_on_pipeline.png)
