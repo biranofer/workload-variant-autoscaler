@@ -79,7 +79,14 @@ Same shape: one mid-run collapse-to-1 (peak 3 at 05:46:39 → 1 by 05:52:16), re
 ## Graphs
 
 Both plots are single-variant runs (no secondary variant deployed) — the flat red "v2" lines in
-each panel are inactive/always-zero, not a data gap.
+each panel are inactive/always-zero, not a data gap. The flag-OFF run's `wva_target_timeseries.json`
+(WVA-desired overlay) and `capacity_demand_estimate.json` (demand-vs-capacity panel) weren't
+generated at the time — `dump_wva_target_timeseries.py` reads live via `kubectl logs`, and by the
+time it would have run the controller had already been restarted for the next leg, past the
+window. Regenerated both after the fact: the demand-estimate script works from the run's saved
+raw vLLM/EPP scrapes (no controller-log dependency), and the WVA-desired series was rebuilt by
+replaying the same "Applied saturation decision" pattern against the full controller log already
+saved in `results/.../wva-controller.log`.
 
 ### Flag ON — ramps to 5, one sharp collapse-to-1, recovers to 3
 
@@ -99,6 +106,11 @@ Same shape: `1→2→3` early, drops to 1 as load between stages eases, then cli
 utilization saturates again (~100%) with vLLM waiting queue peaking near 140 and EPP flow-control
 queue peaking near 150 — both higher peaks than the ON run's corresponding spike. Holds at 3-4
 through the rest of the sustained stage before the end-of-run drain to 1.
+
+Worth noting: the WVA-desired dashed line visibly **leads** the ready-replica solid line at every
+step here (e.g. desired jumps to 3 at ~05:44 before ready follows at ~05:46; desired jumps to 4 at
+~05:55 before ready catches up seconds later) — that lag is pod-startup time, not a control-loop
+delay, and it's present in both legs.
 
 ## Reading these numbers
 
