@@ -44,6 +44,8 @@ Flag toggled via two separately built images (`EnableRateAnchoredK2` is a Go bui
 | avg EPP queue depth          |    2.19 |     3.54 |
 | avg pod startup (s)           |     88 |       86 |
 | TTFT mean (s)                |    0.74 |     0.79 |
+| TTFT p50 (s)                  |    0.08 |     0.08 |
+| TTFT p90 (s)                  |    3.24 |     3.70 |
 | TTFT p99 (s)                  |    7.58 |     7.40 |
 | Request latency mean (s)       |    6.27 |     6.34 |
 | Request latency p99 (s)        |   21.96 |    22.51 |
@@ -117,7 +119,7 @@ delay, and it's present in both legs.
 
 ## Reading these numbers
 
-**Flag ON halves the error rate** (67 vs 132 failed requests) and **lowers EPP queue depth** substantially (2.19 vs 3.54 avg) — consistent with the rate-anchored estimator tracking real arrival throughput rather than an inflated KV-stock history. Request latency p99 is marginally better under ON (21.96s vs 22.51s); TTFT is roughly flat either way (mean slightly better under ON, p99 slightly better under OFF — noise-level).
+**Flag ON halves the error rate** (67 vs 132 failed requests) and **lowers EPP queue depth** substantially (2.19 vs 3.54 avg) — consistent with the rate-anchored estimator tracking real arrival throughput rather than an inflated KV-stock history. Request latency p99 is marginally better under ON (21.96s vs 22.51s); TTFT p50 is identical (0.08s either way), p90 favors ON (3.24s vs 3.70s), p99 slightly favors OFF (7.58s vs 7.40s) — mean/p90 lean ON, p99 is noise-level either way.
 
 **The dramatic difference the plan doc predicted did not show up in replica-count stability.** [`docs/plans/engine/rate-anchored-k2.md`](../docs/plans/engine/rate-anchored-k2.md)'s validation section expected the "two overshoot-correct cycles" seen in the original comparison run to *disappear* under flag ON. Instead, both legs here show the **same shape**: one mid-run ramp-to-peak → collapse-to-1 → partial recovery cycle, comparable in timing and amplitude. The oscillation pattern itself doesn't visibly improve at this specific rate profile — the win shows up in error rate and queue depth, not in replica-count behavior.
 
