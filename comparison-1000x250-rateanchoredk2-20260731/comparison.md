@@ -76,6 +76,30 @@ One mid-run collapse-to-1 (peak 5 at 05:05:42 → 1 by 05:11:04), recovers to 3,
 
 Same shape: one mid-run collapse-to-1 (peak 3 at 05:46:39 → 1 by 05:52:16), recovers to 4, then scales down to 1 at 06:02:22, again aligned with load-profile end.
 
+## Graphs
+
+Both plots are single-variant runs (no secondary variant deployed) — the flat red "v2" lines in
+each panel are inactive/always-zero, not a data gap.
+
+### Flag ON — ramps to 5, one sharp collapse-to-1, recovers to 3
+
+![WVA flag ON pipeline](img/wva_on_pipeline.png)
+
+Replica count climbs `1→2→3→4→5` as KV utilization and requests-running rise through the rate=20
+and rate=24 stages, peaks at 5 while KV cache hits ~100%, then collapses `5→4→1` within about a
+minute once the queue drains. Recovers to 3 for the remainder of the sustained stage. The
+estimated-demand panel shows two clear bars-exceed-capacity spikes (the two KV-utilization peaks)
+where vLLM waiting queue and EPP flow-control queue both spike into the hundreds before draining.
+
+### Flag OFF — ramps to 4, one sharp collapse-to-1, recovers to 4
+
+![WVA flag OFF pipeline](img/wva_off_pipeline.png)
+
+Same shape: `1→2→3` early, drops to 1 as load between stages eases, then climbs `2→3→4` as KV
+utilization saturates again (~100%) with vLLM waiting queue peaking near 140 and EPP flow-control
+queue peaking near 150 — both higher peaks than the ON run's corresponding spike. Holds at 3-4
+through the rest of the sustained stage before the end-of-run drain to 1.
+
 ## Reading these numbers
 
 **Flag ON halves the error rate** (67 vs 132 failed requests) and **lowers EPP queue depth** substantially (2.19 vs 3.54 avg) — consistent with the rate-anchored estimator tracking real arrival throughput rather than an inflated KV-stock history. Request latency p99 is marginally better under ON (21.96s vs 22.51s); TTFT is roughly flat either way (mean slightly better under ON, p99 slightly better under OFF — noise-level).
