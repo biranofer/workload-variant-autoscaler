@@ -246,7 +246,8 @@ def to_dt(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
-def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[int] | None = None):
+def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[int] | None = None,
+         scale_up_threshold: float = 0.85, scale_down_boundary: float = 0.70):
     decode_series, epp_series = collect(results_dir / "metrics" / "raw")
     drows = aggregate_decode(decode_series)
     erows = epp_panels(epp_series)
@@ -450,12 +451,12 @@ def plot(results_dir: Path, out_path: Path, title_suffix: str, stage_sec: list[i
         sat_v2  = [s.get("v2", {}).get("wva_saturation_utilization") for s in wva_full]
         ax.plot(x_wva, sat_pri, color=PRIMARY_COLOR, label="primary", linewidth=2)
         ax.plot(x_wva, sat_v2,  color=V2_COLOR,      label="v2",      linewidth=2)
-        # Reference lines from the saturation config: 0.85 scale-up, 0.70 scale-down
-        ax.axhline(0.85, color="black", linestyle=":", linewidth=0.8, alpha=0.6)
-        ax.axhline(0.70, color="black", linestyle=":", linewidth=0.8, alpha=0.6)
-        ax.text(x_wva[-1] if x_wva else 0, 0.85, " 0.85 scaleUp",
+        # Reference lines from the saturation config actually used for this run.
+        ax.axhline(scale_up_threshold, color="black", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.axhline(scale_down_boundary, color="black", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.text(x_wva[-1] if x_wva else 0, scale_up_threshold, f" {scale_up_threshold} scaleUp",
                 fontsize=7, va="center")
-        ax.text(x_wva[-1] if x_wva else 0, 0.70, " 0.70 scaleDown",
+        ax.text(x_wva[-1] if x_wva else 0, scale_down_boundary, f" {scale_down_boundary} scaleDown",
                 fontsize=7, va="center")
         ax.set_ylabel("utilization")
         ax.legend(loc="upper left", fontsize=7)
@@ -546,12 +547,17 @@ def main():
         default="",
         help="Comma-separated seconds from run start for stage-change lines (e.g. 300,1020)",
     )
+    ap.add_argument("--scale-up-threshold", type=float, default=0.85,
+                     help="scaleUpThreshold actually used for this run (default: shipped default 0.85)")
+    ap.add_argument("--scale-down-boundary", type=float, default=0.70,
+                     help="scaleDownBoundary actually used for this run (default: shipped default 0.70)")
     args = ap.parse_args()
     stage_sec = [int(s) for s in args.stage_sec.split(",") if s.strip()] if args.stage_sec else None
     rd = Path(args.results_dir).resolve()
     out = rd / "metrics" / "graphs" / args.name
     out.parent.mkdir(parents=True, exist_ok=True)
-    plot(rd, out, args.suffix, stage_sec=stage_sec)
+    plot(rd, out, args.suffix, stage_sec=stage_sec,
+         scale_up_threshold=args.scale_up_threshold, scale_down_boundary=args.scale_down_boundary)
 
 
 if __name__ == "__main__":
