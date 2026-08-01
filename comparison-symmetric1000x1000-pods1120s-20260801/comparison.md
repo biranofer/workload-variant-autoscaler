@@ -86,6 +86,21 @@ fixed for future runs: the `ServiceMonitor`'s `tlsConfig.serverName` was hardcod
 `wva-system` instead of the actual `biran` namespace, failing TLS verification on every scrape
 attempt — see the feedback note on this bug). Not recoverable for these two runs after the fact.
 
+Dashed gray vertical lines mark the Poisson load-profile's stage transitions and the point where
+arrivals stop (measured elapsed seconds per stage, not nominal) — **not** where all activity
+stops. Both graphs' x-axis extends well past that "end" line: in-flight requests (up to ~1000
+output tokens each) keep decoding, and the `Pods1/120s` policy metering the descent from a peak
+of 7-10 replicas back to 1 alone takes 12+ minutes. `harness_stop` lands 23 minutes after the
+arrival schedule's nominal end for both legs — that tail is genuine data, not a rendering
+artifact.
+
+The OFF run's `wva_target_timeseries.json` (WVA-desired dashed overlay) initially came back
+empty (0 snapshots) due to a transient `kubectl` auth failure at the exact moment
+`post_run_analyze.sh` ran (the same session-token expiry hit later while querying Thanos) —
+the dump script doesn't surface that failure, it just silently writes an empty result. Recovered
+by re-running the dump: the controller pod hadn't been restarted since the run, so the log
+history was still live-queryable.
+
 ### ON — one ramp, one long hold, one drain
 
 ![WVA flag ON pipeline](img/wva_on_pipeline.png)
