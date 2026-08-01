@@ -144,7 +144,7 @@ triggering the second replica ramp described above.
 
 ### ON (v3) — same cold start, same long hold, plus working utilization/KV-token panels
 
-![WVA flag ON v3 pipeline](img/wva_on_v3_pipeline.png)
+![WVA flag ON v3 pipeline](img/symmetric_on_v3_pipeline.png)
 
 Reproduces the first ON leg almost exactly: violent cold-start burst, hold at 7 for ~22 minutes,
 clean drain. New here: the analyzer-internal utilization panel shows the hold period sitting
@@ -153,7 +153,7 @@ below 0.60 to justify draining below 7 until the load itself eases near the end.
 
 ### OFF (v3) — same cold start, no second oscillation this time
 
-![WVA flag OFF v3 pipeline](img/wva_off_v3_pipeline.png)
+![WVA flag OFF v3 pipeline](img/symmetric_off_v3_pipeline.png)
 
 Unlike the first OFF leg, no re-ramp: after the cold-start burst, replicas drain to 4 and hold
 there for ~17 minutes while utilization climbs gradually from ~0.15 to ~0.55 — approaching but
