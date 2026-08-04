@@ -313,6 +313,30 @@ scale, reading WVA's own computed target off Prometheus instead of a native
 | Avg pod startup (s) | 63 | 66 | 66 | 65 |
 | Cost (avg replicas × GPU/hr) | 1.98 | 1.86 | 1.83 | 1.89 |
 
+### Decode Heavy — Qwen/Qwen3-0.6B (V2 Saturation via KEDA, 600s)
+
+**Model:** Qwen/Qwen3-0.6B
+**Workload:** 1000 prompt tokens, 4000 output tokens, 20 RPS, 600s duration
+**Saturation Engine:** V2 (token/capacity-based)
+**Setup:** See [V2 Saturation via KEDA Configuration](#v2-saturation-via-keda-configuration)
+
+| Metric | Run 1 | Run 2 | Run 3 | Avg |
+|--------|-------|-------|-------|-----|
+| P99 TTFT (ms) | 143,329 | 35,864 | 11,562 | 63,585 |
+| P99 ITL (ms/token) | 42.26 | 26.34 | 24.70 | 31.10 |
+| Avg replicas | 6.23 | 5.57 | 6.59 | 6.13 |
+| Max replicas | 9 | 7 | 8 | 8.0 |
+| Avg KV cache utilization | 23.6% | 34.2% | 28.3% | 28.7% |
+| Avg queue depth (EPP) | 16.9 | 1.9 | 1.3 | 6.7 |
+| Error count | 0 | 0 | 0 | 0 |
+| Avg pod startup (s) | 72 | 80 | 73 | 75 |
+| Cost (avg replicas × GPU/hr) | 6.23 | 5.57 | 6.59 | 6.13 |
+
+Note: TTFT shows heavy run-to-run variance (143k → 36k → 12k ms) despite consistent 0
+errors and similar replica counts — likely a scale-timing effect rather than steady-state
+behavior, since each run started from whatever scaled state the prior run left behind
+rather than a fully cold pool.
+
 ### Decode Heavy — Qwen/Qwen3-0.6B (1800s)
 
 **llm-d Release:** v0.6.0
